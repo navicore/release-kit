@@ -1,0 +1,15 @@
+[package]
+name = "release-kit-generator"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+release-kit-core = { workspace = true }
+leptos = { workspace = true }
+pulldown-cmark = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }

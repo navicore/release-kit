@@ -1,0 +1,14 @@
+[package]
+name = "release-kit-validator"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+release-kit-core = { workspace = true }
+anyhow = { workspace = true }
+lofty = { workspace = true }
+image = { workspace = true }
+walkdir = { workspace = true }
