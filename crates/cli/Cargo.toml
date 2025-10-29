@@ -27,3 +27,6 @@ notify = { workspace = true }
 walkdir = { workspace = true }
 lofty = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

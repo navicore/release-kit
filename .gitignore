@@ -17,4 +17,3 @@ Thumbs.db
 
 # Cargo lock for libraries
 # Cargo.lock
-EOF < /dev/null

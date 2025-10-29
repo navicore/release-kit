@@ -2554,6 +2554,7 @@ dependencies = [
  "release-kit-deployer",
  "release-kit-generator",
  "release-kit-validator",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http 0.5.2",
