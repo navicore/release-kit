@@ -1,0 +1,52 @@
+[album]
+title = "Concrete Frequencies"
+artist = "Test Artist"
+release_date = "2025-11-15"
+summary = "Urban soundscapes through granular synthesis and field recordings"
+genre = ["experimental", "electroacoustic", "drone"]
+catalog_number = "TA-001"
+license = "CC BY-NC-SA 4.0"
+liner_notes = "notes/album.md"
+
+[artist]
+name = "Test Artist"
+url = "https://testartist.example.com"
+bio = "Experimental musician exploring the intersection of field recordings and synthesis"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "concrete-frequencies.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "audio/01-infrastructure-hum.flac"
+title = "Infrastructure Hum"
+duration = "7:23"
+liner_notes = "notes/track-01.md"
+
+[[track]]
+file = "audio/02-resonant-decay.flac"
+title = "Resonant Decay"
+duration = "5:47"
+
+[[track]]
+file = "audio/03-harmonic-collapse.flac"
+title = "Harmonic Collapse"
+duration = "9:12"
+liner_notes = "notes/track-03.md"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac", "mp3-320"]
+
+[hosting.cloudflare]
+account_id = "your-cloudflare-account-id"
+r2_bucket = "music-releases"
+pages_project = "concrete-frequencies"
+
+[rss]
+enabled = true

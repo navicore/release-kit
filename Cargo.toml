@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/core",
+    "crates/validator",
+    "crates/generator",
+    "crates/deployer",
+    # Note: worker-template has separate compilation target, not in workspace
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Ed Sweeney <navicore@gmail.com>"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/navicore/release-kit"
+
+[workspace.dependencies]
+# CLI & orchestration
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+# Config & serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Site generation - SSR only, no hydration
+leptos = { version = "0.7", default-features = false, features = ["ssr"] }
+
+# Audio metadata
+lofty = "0.21"
+
+# Image validation
+image = "0.25"
+
+# Markdown
+pulldown-cmark = "0.12"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+
+# Local preview server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+tower = "0.5"
+notify = "6"
+
+# Utilities
+walkdir = "2"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+# Internal crates (for cross-crate dependencies)
+release-kit-core = { path = "crates/core" }
+release-kit-validator = { path = "crates/validator" }
+release-kit-generator = { path = "crates/generator" }
+release-kit-deployer = { path = "crates/deployer" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
