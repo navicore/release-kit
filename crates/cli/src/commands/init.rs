@@ -263,7 +263,7 @@ fn extract_track_metadata(audio_files: &[PathBuf]) -> Result<Vec<DetectedTrack>>
 ///
 /// - `01-infrastructure-hum.flac` → "Infrastructure Hum"
 /// - `02_resonant_decay.flac` → "Resonant Decay"
-/// - `track-03.flac` → "Track 3"
+/// - `track-01.flac` → "Track 1"
 fn extract_track_title(path: &Path, track_number: usize) -> String {
     let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Track");
 
@@ -275,7 +275,8 @@ fn extract_track_title(path: &Path, track_number: usize) -> String {
         .trim_start_matches('_')
         .trim();
 
-    if cleaned.is_empty() {
+    // If empty or only contains digits, use fallback
+    if cleaned.is_empty() || cleaned.chars().all(|c| c.is_ascii_digit()) {
         return format!("Track {}", track_number);
     }
 
@@ -517,15 +518,15 @@ mod tests {
         let path = Path::new("01.flac");
         assert_eq!(extract_track_title(path, 1), "Track 1");
 
-        // Test filename with "track" prefix - the current logic leaves trailing digits
+        // Test filename with "track" prefix - now correctly returns "Track 1"
         let path = Path::new("track-01.flac");
-        assert_eq!(extract_track_title(path, 1), "01");
+        assert_eq!(extract_track_title(path, 1), "Track 1");
 
         // Test filename with no number prefix
         let path = Path::new("ambient-soundscape.mp3");
         assert_eq!(extract_track_title(path, 5), "Ambient Soundscape");
 
-        // Test with dots in prefix - strips all leading digits/dots/dashes including "track-"
+        // Test with dots in prefix - strips leading patterns leaving only name
         let path = Path::new("01.02-track-name.ogg");
         assert_eq!(extract_track_title(path, 1), "Name");
     }

@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::types::*;
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Raw TOML configuration structure
 /// This matches the album.toml file structure exactly
@@ -68,7 +68,13 @@ pub fn parse_album_toml_str(content: &str) -> Result<Album> {
     let release_date = chrono::NaiveDate::parse_from_str(&raw.album.release_date, "%Y-%m-%d")
         .map_err(|e| Error::ConfigParse(format!("Invalid release_date: {}", e)))?;
 
-    // Convert album metadata
+    // Convert album metadata, validating paths
+    let liner_notes = if let Some(notes_path) = raw.album.liner_notes {
+        Some(validate_path(&notes_path, "album.liner_notes")?)
+    } else {
+        None
+    };
+
     let metadata = AlbumMetadata {
         title: raw.album.title,
         artist: raw.album.artist,
@@ -77,7 +83,7 @@ pub fn parse_album_toml_str(content: &str) -> Result<Album> {
         genre: raw.album.genre,
         catalog_number: raw.album.catalog_number,
         license: raw.album.license,
-        liner_notes: raw.album.liner_notes.map(|s| s.into()),
+        liner_notes,
     };
 
     // Convert artist
@@ -88,7 +94,7 @@ pub fn parse_album_toml_str(content: &str) -> Result<Album> {
         rss_author_email: raw.artist.rss_author_email,
     };
 
-    // Convert tracks
+    // Convert tracks, validating all paths
     let tracks: Result<Vec<Track>> = raw
         .track
         .into_iter()
@@ -99,11 +105,18 @@ pub fn parse_album_toml_str(content: &str) -> Result<Album> {
                 None
             };
 
+            let file = validate_path(&t.file, "track.file")?;
+            let liner_notes = if let Some(notes_path) = t.liner_notes {
+                Some(validate_path(&notes_path, "track.liner_notes")?)
+            } else {
+                None
+            };
+
             Ok(Track {
-                file: t.file.into(),
+                file,
                 title: t.title,
                 duration,
-                liner_notes: t.liner_notes.map(|s| s.into()),
+                liner_notes,
             })
         })
         .collect();
@@ -119,6 +132,70 @@ pub fn parse_album_toml_str(content: &str) -> Result<Album> {
         },
         rss: raw.rss,
     })
+}
+
+/// Validate and convert a path string to PathBuf.
+///
+/// This function prevents path traversal vulnerabilities by rejecting:
+/// - Absolute paths (starting with `/` or Windows drive letters)
+/// - Paths containing parent directory references (`..`)
+///
+/// # Security
+///
+/// This is critical for preventing malicious album.toml files from
+/// accessing files outside the project directory.
+///
+/// # Arguments
+///
+/// * `path_str` - The path string from user input (album.toml)
+/// * `field_name` - Name of the field for error messages
+///
+/// # Returns
+///
+/// A validated relative PathBuf, or an error if the path is unsafe
+///
+/// # Examples
+///
+/// ```text
+/// // Valid relative paths
+/// validate_path("audio/track.flac", "file")  → Ok(PathBuf)
+/// validate_path("notes/album.md", "liner_notes")  → Ok(PathBuf)
+///
+/// // Invalid paths
+/// validate_path("/etc/passwd", "file")  → Err("Absolute paths not allowed...")
+/// validate_path("../../../etc/passwd", "file")  → Err("Parent directory references...")
+/// validate_path("C:\\Windows\\System32", "file")  → Err("Absolute paths not allowed...")
+/// ```
+fn validate_path(path_str: &str, field_name: &str) -> Result<PathBuf> {
+    let path = Path::new(path_str);
+
+    // Reject absolute paths
+    if path.is_absolute() {
+        return Err(Error::ConfigParse(format!(
+            "Absolute paths not allowed in '{}': '{}'. Use relative paths only.",
+            field_name, path_str
+        )));
+    }
+
+    // Check for parent directory references
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            return Err(Error::ConfigParse(format!(
+                "Parent directory references (..) not allowed in '{}': '{}'",
+                field_name, path_str
+            )));
+        }
+    }
+
+    // Ensure path is not empty
+    if path_str.trim().is_empty() {
+        return Err(Error::ConfigParse(format!(
+            "Empty path in '{}' field",
+            field_name
+        )));
+    }
+
+    Ok(path.to_path_buf())
 }
 
 /// Parse duration string in format "MM:SS" or "M:SS"
@@ -160,6 +237,96 @@ mod tests {
         assert_eq!(parse_duration("12:00").unwrap().as_secs(), 720);
         assert!(parse_duration("5:60").is_err());
         assert!(parse_duration("invalid").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_valid_relative() {
+        // Valid relative paths
+        assert!(validate_path("audio/track.flac", "file").is_ok());
+        assert!(validate_path("notes/album.md", "liner_notes").is_ok());
+        assert!(validate_path("artwork/cover.jpg", "cover").is_ok());
+        assert!(validate_path("subdir/nested/file.txt", "file").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_absolute_unix() {
+        // Unix absolute paths
+        let result = validate_path("/etc/passwd", "file");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute paths not allowed")
+        );
+
+        let result = validate_path("/root/.ssh/id_rsa", "file");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_absolute_windows() {
+        // Windows absolute paths (only on Windows platform)
+        #[cfg(target_os = "windows")]
+        {
+            let result = validate_path("C:\\Windows\\System32", "file");
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Absolute paths not allowed")
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_rejects_parent_dir() {
+        // Parent directory references
+        let result = validate_path("../etc/passwd", "file");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Parent directory references")
+        );
+
+        let result = validate_path("../../secret.txt", "file");
+        assert!(result.is_err());
+
+        let result = validate_path("audio/../../../etc/passwd", "file");
+        assert!(result.is_err());
+
+        // Multiple levels
+        let result = validate_path("foo/bar/../../../baz", "file");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_empty() {
+        let result = validate_path("", "file");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Empty path"));
+
+        let result = validate_path("   ", "file");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_path_field_name_in_error() {
+        let result = validate_path("/etc/passwd", "track.file");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("track.file"));
+
+        let result = validate_path("../secret", "album.liner_notes");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("album.liner_notes")
+        );
     }
 
     #[test]
@@ -206,5 +373,152 @@ enabled = true
         assert_eq!(album.metadata.title, "Test Album");
         assert_eq!(album.tracks.len(), 1);
         assert_eq!(album.tracks[0].title, "Test Track");
+    }
+
+    #[test]
+    fn test_parse_config_rejects_path_traversal_in_track() {
+        let toml = r##"
+[album]
+title = "Malicious Album"
+artist = "Hacker"
+release_date = "2025-11-15"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "../../../etc/passwd"
+title = "Evil Track"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let result = parse_album_toml_str(toml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Parent directory references")
+        );
+    }
+
+    #[test]
+    fn test_parse_config_rejects_absolute_path_in_track() {
+        let toml = r##"
+[album]
+title = "Malicious Album"
+artist = "Hacker"
+release_date = "2025-11-15"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "/etc/passwd"
+title = "Evil Track"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let result = parse_album_toml_str(toml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Absolute paths not allowed")
+        );
+    }
+
+    #[test]
+    fn test_parse_config_rejects_path_traversal_in_liner_notes() {
+        let toml = r##"
+[album]
+title = "Malicious Album"
+artist = "Hacker"
+release_date = "2025-11-15"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+liner_notes = "../../etc/shadow"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let result = parse_album_toml_str(toml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Parent directory references")
+        );
     }
 }
