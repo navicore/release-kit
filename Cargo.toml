@@ -48,6 +48,8 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["fs", "trace"] }
 tower = "0.5"
 notify = "6"
+async-stream = "0.3"
+futures = "0.3"
 
 # Utilities
 walkdir = "2"
