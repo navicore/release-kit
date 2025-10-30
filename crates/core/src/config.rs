@@ -521,4 +521,339 @@ enabled = true
                 .contains("Parent directory references")
         );
     }
+
+    #[test]
+    fn test_parse_config_rejects_invalid_date_formats() {
+        // Test various invalid date formats
+        let invalid_dates = vec![
+            "2025-13-01", // Invalid month
+            "2025-11-32", // Invalid day
+            "2025/11/15", // Wrong separator
+            "11-15-2025", // Wrong order
+            "invalid",    // Not a date
+            "",           // Empty
+        ];
+
+        for invalid_date in invalid_dates {
+            let toml = format!(
+                r##"
+[album]
+title = "Test Album"
+artist = "Test Artist"
+release_date = "{}"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+            "##,
+                invalid_date
+            );
+
+            let result = parse_album_toml_str(&toml);
+            assert!(
+                result.is_err(),
+                "Expected error for invalid date: {}",
+                invalid_date
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_edge_cases() {
+        // Valid edge cases
+        assert_eq!(parse_duration("0:00").unwrap().as_secs(), 0);
+        assert_eq!(parse_duration("0:01").unwrap().as_secs(), 1);
+        assert_eq!(parse_duration("0:59").unwrap().as_secs(), 59);
+        assert_eq!(parse_duration("999:59").unwrap().as_secs(), 59999);
+
+        // Invalid formats
+        assert!(parse_duration("60").is_err()); // Missing colon
+        assert!(parse_duration("5:").is_err()); // Missing seconds
+        assert!(parse_duration(":30").is_err()); // Missing minutes
+        assert!(parse_duration("5:60").is_err()); // Seconds >= 60
+        assert!(parse_duration("5:99").is_err()); // Seconds >= 60
+        assert!(parse_duration("-5:30").is_err()); // Negative minutes
+        assert!(parse_duration("5:-30").is_err()); // Negative seconds
+        assert!(parse_duration("5:30:00").is_err()); // Too many parts
+        assert!(parse_duration("abc:def").is_err()); // Non-numeric
+        assert!(parse_duration("").is_err()); // Empty
+        assert!(parse_duration("5.5:30").is_err()); // Decimal minutes
+    }
+
+    #[test]
+    fn test_parse_config_with_optional_duration() {
+        // Test that duration is optional
+        let toml = r##"
+[album]
+title = "Test Album"
+artist = "Test Artist"
+release_date = "2025-11-15"
+summary = "A test album"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "audio/01-test.flac"
+title = "Track Without Duration"
+
+[[track]]
+file = "audio/02-test.flac"
+title = "Track With Duration"
+duration = "5:23"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let album = parse_album_toml_str(toml).unwrap();
+        assert_eq!(album.tracks.len(), 2);
+        assert!(album.tracks[0].duration.is_none());
+        assert!(album.tracks[1].duration.is_some());
+        assert_eq!(album.tracks[1].duration.unwrap().as_secs(), 323);
+    }
+
+    #[test]
+    fn test_parse_config_validates_required_fields() {
+        // Test missing title
+        let toml_missing_title = r##"
+[album]
+artist = "Test Artist"
+release_date = "2025-11-15"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let result = parse_album_toml_str(toml_missing_title);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("missing field")
+        );
+    }
+
+    #[test]
+    fn test_validate_path_complex_traversal_attempts() {
+        // Various sneaky path traversal attempts
+        let malicious_paths = vec![
+            "audio/../../etc/passwd",
+            "./../../secret.txt",
+            "audio/./../../../root/.ssh/id_rsa",
+            "foo/bar/../../../../../../etc/shadow",
+            "..",
+            "../",
+            "../../",
+        ];
+
+        for path in malicious_paths {
+            let result = validate_path(path, "test_field");
+            assert!(
+                result.is_err(),
+                "Expected error for path traversal attempt: {}",
+                path
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Parent directory") || err_msg.contains("Empty path"),
+                "Error message should mention parent directory or empty path for: {}. Got: {}",
+                path,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_with_special_characters() {
+        // Valid paths with special characters
+        assert!(validate_path("audio/track-01.flac", "file").is_ok());
+        assert!(validate_path("audio/track_01.flac", "file").is_ok());
+        assert!(validate_path("audio/track (1).flac", "file").is_ok());
+        assert!(validate_path("artwork/cover [300dpi].jpg", "file").is_ok());
+        assert!(validate_path("notes/liner-notes.md", "file").is_ok());
+
+        // Paths with unicode (should be valid)
+        assert!(validate_path("audio/トラック01.flac", "file").is_ok());
+        assert!(validate_path("audio/piste_numéro_1.flac", "file").is_ok());
+    }
+
+    #[test]
+    fn test_parse_config_with_multiple_tracks() {
+        let toml = r##"
+[album]
+title = "Multi-Track Album"
+artist = "Test Artist"
+release_date = "2025-11-15"
+summary = "An album with multiple tracks"
+genre = ["experimental", "electronic"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "audio/01-intro.flac"
+title = "Intro"
+duration = "1:23"
+
+[[track]]
+file = "audio/02-main-track.flac"
+title = "Main Track"
+duration = "5:45"
+liner_notes = "notes/track-02.md"
+
+[[track]]
+file = "audio/03-outro.flac"
+title = "Outro"
+duration = "2:10"
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let album = parse_album_toml_str(toml).unwrap();
+        assert_eq!(album.tracks.len(), 3);
+        assert_eq!(album.tracks[0].title, "Intro");
+        assert_eq!(album.tracks[1].title, "Main Track");
+        assert_eq!(album.tracks[2].title, "Outro");
+        assert!(album.tracks[1].liner_notes.is_some());
+        assert!(album.tracks[0].liner_notes.is_none());
+    }
+
+    #[test]
+    fn test_parse_config_with_empty_track_title() {
+        // Track title cannot be empty (TOML parser should catch this)
+        let toml = r##"
+[album]
+title = "Test Album"
+artist = "Test Artist"
+release_date = "2025-11-15"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "audio/track.flac"
+title = ""
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        // This should parse successfully since TOML allows empty strings
+        // but in a real validator, we might want to reject this
+        let result = parse_album_toml_str(toml);
+        assert!(result.is_ok());
+        let album = result.unwrap();
+        assert_eq!(album.tracks[0].title, "");
+    }
 }
