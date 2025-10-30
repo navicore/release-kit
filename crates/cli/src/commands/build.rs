@@ -9,7 +9,7 @@ use super::template::{detect_cover_art, generate_html, generate_player_js};
 ///
 /// This is the core build logic used by both `build` and `preview` commands.
 /// It generates a complete static site in the output directory.
-pub fn build_static_site(path: &Path, output: &PathBuf, verbose: bool) -> Result<()> {
+pub fn build_static_site(path: &Path, output: &Path, verbose: bool) -> Result<()> {
     // Validate album directory exists
     if !path.exists() {
         anyhow::bail!("Album directory does not exist: {}", path.display());

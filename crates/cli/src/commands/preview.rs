@@ -8,16 +8,14 @@ use axum::{
 use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use release_kit_core::config::parse_album_toml;
 use std::{net::SocketAddr, path::PathBuf};
+use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use super::build::build_static_site;
 
-#[allow(dead_code)]
 #[derive(Clone)]
 struct AppState {
-    source_path: PathBuf,
-    build_path: PathBuf,
     reload_tx: broadcast::Sender<()>,
 }
 
@@ -62,31 +60,30 @@ pub async fn run(path: PathBuf, port: u16) -> Result<()> {
     println!("   ✓ Tracks: {}", album.tracks.len());
     println!();
 
-    // Create temporary build directory
-    let build_dir =
-        std::env::temp_dir().join(format!("release-kit-preview-{}", std::process::id()));
+    // Create temporary build directory (auto-cleanup on drop)
+    let _temp_dir = TempDir::new().context("Failed to create temporary directory")?;
+    let build_dir = _temp_dir.path();
     println!("📦 Building static site to temp directory...");
-    build_static_site(&path, &build_dir, false)?;
+    build_static_site(&path, build_dir, false)
+        .context("Failed to build static site for preview")?;
     println!("   ✓ Built to: {}", build_dir.display());
 
     // Create broadcast channel for reload events
     let (reload_tx, _) = broadcast::channel::<()>(100);
 
     let state = AppState {
-        source_path: path.clone(),
-        build_path: build_dir.clone(),
         reload_tx: reload_tx.clone(),
     };
 
     // Build router - serve built static files
     let app = Router::new()
         .route("/_reload", get(sse_handler))
-        .fallback_service(ServeDir::new(&build_dir))
+        .fallback_service(ServeDir::new(build_dir))
         .with_state(state);
 
     // Start file watcher with rebuild on change
     let watcher_source = path.clone();
-    let watcher_build = build_dir.clone();
+    let watcher_build = build_dir.to_path_buf();
     let watcher_tx = reload_tx.clone();
     tokio::spawn(async move {
         if let Err(e) = watch_and_rebuild(watcher_source, watcher_build, watcher_tx).await {
@@ -103,8 +100,17 @@ pub async fn run(path: PathBuf, port: u16) -> Result<()> {
         .await
         .context("Failed to bind to port")?;
 
-    axum::serve(listener, app).await.context("Server error")?;
+    // Set up graceful shutdown with Ctrl+C
+    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+        println!("\n🛑 Shutting down preview server...");
+    });
 
+    server.await.context("Server error")?;
+
+    // TempDir cleanup happens automatically here when _temp_dir is dropped
     Ok(())
 }
 
