@@ -70,7 +70,8 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
             if src_path.is_file() {
                 let filename = src_path.file_name().unwrap();
                 let dst_path = output.join("artwork").join(filename);
-                fs::copy(&src_path, &dst_path)?;
+                fs::copy(&src_path, &dst_path)
+                    .with_context(|| format!("Failed to copy artwork {}", src_path.display()))?;
                 copied_artwork += 1;
             }
         }
@@ -88,7 +89,9 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
             if src_path.is_file() {
                 let filename = src_path.file_name().unwrap();
                 let dst_path = output.join("notes").join(filename);
-                fs::copy(&src_path, &dst_path)?;
+                fs::copy(&src_path, &dst_path).with_context(|| {
+                    format!("Failed to copy liner notes {}", src_path.display())
+                })?;
                 copied_notes += 1;
             }
         }

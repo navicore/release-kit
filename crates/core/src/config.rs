@@ -94,11 +94,18 @@ pub fn parse_album_toml_str(content: &str) -> Result<Album> {
         rss_author_email: raw.artist.rss_author_email,
     };
 
-    // Convert tracks, validating all paths
+    // Convert tracks, validating all paths and titles
     let tracks: Result<Vec<Track>> = raw
         .track
         .into_iter()
         .map(|t| {
+            // Validate track title is not empty
+            if t.title.trim().is_empty() {
+                return Err(Error::ConfigParse(
+                    "Track title cannot be empty".to_string(),
+                ));
+            }
+
             let duration = if let Some(duration_str) = t.duration {
                 Some(parse_duration(&duration_str)?)
             } else {
@@ -809,8 +816,8 @@ enabled = true
     }
 
     #[test]
-    fn test_parse_config_with_empty_track_title() {
-        // Track title cannot be empty (TOML parser should catch this)
+    fn test_parse_config_rejects_empty_track_title() {
+        // Track title cannot be empty - should be validated
         let toml = r##"
 [album]
 title = "Test Album"
@@ -849,11 +856,64 @@ pages_project = "test-project"
 enabled = true
         "##;
 
-        // This should parse successfully since TOML allows empty strings
-        // but in a real validator, we might want to reject this
         let result = parse_album_toml_str(toml);
-        assert!(result.is_ok());
-        let album = result.unwrap();
-        assert_eq!(album.tracks[0].title, "");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Track title cannot be empty")
+        );
+    }
+
+    #[test]
+    fn test_parse_config_rejects_whitespace_only_track_title() {
+        // Track title with only whitespace should also be rejected
+        let toml = r##"
+[album]
+title = "Test Album"
+artist = "Test Artist"
+release_date = "2025-11-15"
+summary = "Test"
+genre = ["experimental"]
+license = "CC BY-NC-SA 4.0"
+
+[artist]
+name = "Test Artist"
+rss_author_email = "test@example.com"
+
+[site]
+domain = "test.example.com"
+theme = "default"
+accent_color = "#ff6b35"
+
+[[track]]
+file = "audio/track.flac"
+title = "   "
+
+[distribution]
+streaming_enabled = true
+download_enabled = false
+pay_what_you_want = false
+tip_jar_enabled = false
+download_formats = ["flac"]
+
+[hosting.cloudflare]
+account_id = "test-account"
+r2_bucket = "test-bucket"
+pages_project = "test-project"
+
+[rss]
+enabled = true
+        "##;
+
+        let result = parse_album_toml_str(toml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Track title cannot be empty")
+        );
     }
 }
