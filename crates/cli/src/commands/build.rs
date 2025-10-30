@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
 use release_kit_core::config::parse_album_toml;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::template::{detect_cover_art, generate_html, generate_player_js};
 
-/// Build static site for deployment
-pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
-    println!("🔨 Building static site...");
-    println!("   Source: {}", path.display());
-    println!("   Output: {}", output.display());
-    println!();
-
+/// Build static site (internal implementation)
+///
+/// This is the core build logic used by both `build` and `preview` commands.
+/// It generates a complete static site in the output directory.
+pub fn build_static_site(path: &Path, output: &PathBuf, verbose: bool) -> Result<()> {
     // Validate album directory exists
     if !path.exists() {
         anyhow::bail!("Album directory does not exist: {}", path.display());
@@ -29,21 +27,29 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
 
     let album = parse_album_toml(&album_toml_path).context("Failed to parse album.toml")?;
 
-    println!("✓ Loaded: {}", album.metadata.title);
-    println!("  Artist: {}", album.metadata.artist);
-    println!("  Tracks: {}", album.tracks.len());
-    println!();
+    if verbose {
+        println!("✓ Loaded: {}", album.metadata.title);
+        println!("  Artist: {}", album.metadata.artist);
+        println!("  Tracks: {}", album.tracks.len());
+        println!();
+    }
 
     // Create output directory structure
-    println!("📁 Creating output directory structure...");
-    fs::create_dir_all(&output).context("Failed to create output directory")?;
+    if verbose {
+        println!("📁 Creating output directory structure...");
+    }
+    fs::create_dir_all(output).context("Failed to create output directory")?;
     fs::create_dir_all(output.join("audio")).context("Failed to create audio directory")?;
     fs::create_dir_all(output.join("artwork")).context("Failed to create artwork directory")?;
     fs::create_dir_all(output.join("notes")).context("Failed to create notes directory")?;
-    println!("   ✓ Created directories");
+    if verbose {
+        println!("   ✓ Created directories");
+    }
 
     // Copy audio files
-    println!("🎵 Copying audio files...");
+    if verbose {
+        println!("🎵 Copying audio files...");
+    }
     let mut copied_audio = 0;
     for track in &album.tracks {
         let src = path.join(&track.file);
@@ -57,10 +63,14 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
             eprintln!("   ⚠ Warning: Audio file not found: {}", src.display());
         }
     }
-    println!("   ✓ Copied {} audio files", copied_audio);
+    if verbose {
+        println!("   ✓ Copied {} audio files", copied_audio);
+    }
 
     // Copy artwork
-    println!("🎨 Copying artwork...");
+    if verbose {
+        println!("🎨 Copying artwork...");
+    }
     let artwork_src = path.join("artwork");
     let mut copied_artwork = 0;
     if artwork_src.exists() {
@@ -76,10 +86,14 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
             }
         }
     }
-    println!("   ✓ Copied {} artwork files", copied_artwork);
+    if verbose {
+        println!("   ✓ Copied {} artwork files", copied_artwork);
+    }
 
     // Copy liner notes
-    println!("📝 Copying liner notes...");
+    if verbose {
+        println!("📝 Copying liner notes...");
+    }
     let notes_src = path.join("notes");
     let mut copied_notes = 0;
     if notes_src.exists() {
@@ -96,20 +110,42 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
             }
         }
     }
-    println!("   ✓ Copied {} liner note files", copied_notes);
+    if verbose {
+        println!("   ✓ Copied {} liner note files", copied_notes);
+    }
 
     // Generate index.html
-    println!("📄 Generating index.html...");
+    if verbose {
+        println!("📄 Generating index.html...");
+    }
     let cover_art = detect_cover_art(&path.join("artwork"));
     let html = generate_html(&album, cover_art.as_deref(), false);
     fs::write(output.join("index.html"), html).context("Failed to write index.html")?;
-    println!("   ✓ Generated index.html");
+    if verbose {
+        println!("   ✓ Generated index.html");
+    }
 
     // Generate player.js
-    println!("🎮 Generating player.js...");
+    if verbose {
+        println!("🎮 Generating player.js...");
+    }
     let player_js = generate_player_js();
     fs::write(output.join("player.js"), player_js).context("Failed to write player.js")?;
-    println!("   ✓ Generated player.js");
+    if verbose {
+        println!("   ✓ Generated player.js");
+    }
+
+    Ok(())
+}
+
+/// Build static site for deployment (command interface)
+pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
+    println!("🔨 Building static site...");
+    println!("   Source: {}", path.display());
+    println!("   Output: {}", output.display());
+    println!();
+
+    build_static_site(&path, &output, true)?;
 
     println!();
     println!("✅ Build complete!");

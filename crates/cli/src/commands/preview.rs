@@ -2,10 +2,7 @@ use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::State,
-    response::{
-        Html, IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
+    response::sse::{Event, KeepAlive, Sse},
     routing::get,
 };
 use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
@@ -14,21 +11,22 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
-use super::template::{detect_cover_art, generate_html, generate_player_js};
+use super::build::build_static_site;
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct AppState {
-    album_path: PathBuf,
+    source_path: PathBuf,
+    build_path: PathBuf,
     reload_tx: broadcast::Sender<()>,
 }
 
 /// Start preview server with hot reload for local development.
 ///
 /// This command:
-/// - Validates and loads album.toml
-/// - Generates a simple preview HTML page
-/// - Serves static files (audio, artwork)
-/// - Watches for file changes and triggers hot reload
+/// - Builds the static site to a temporary directory
+/// - Serves the built static files (exactly what will be deployed)
+/// - Watches for file changes, rebuilds, and triggers hot reload
 ///
 /// # Arguments
 ///
@@ -62,29 +60,36 @@ pub async fn run(path: PathBuf, port: u16) -> Result<()> {
     println!("   ✓ Loaded: {}", album.metadata.title);
     println!("   ✓ Artist: {}", album.metadata.artist);
     println!("   ✓ Tracks: {}", album.tracks.len());
+    println!();
+
+    // Create temporary build directory
+    let build_dir =
+        std::env::temp_dir().join(format!("release-kit-preview-{}", std::process::id()));
+    println!("📦 Building static site to temp directory...");
+    build_static_site(&path, &build_dir, false)?;
+    println!("   ✓ Built to: {}", build_dir.display());
 
     // Create broadcast channel for reload events
     let (reload_tx, _) = broadcast::channel::<()>(100);
 
     let state = AppState {
-        album_path: path.clone(),
+        source_path: path.clone(),
+        build_path: build_dir.clone(),
         reload_tx: reload_tx.clone(),
     };
 
-    // Build router
+    // Build router - serve built static files
     let app = Router::new()
-        .route("/", get(index_handler))
         .route("/_reload", get(sse_handler))
-        .route("/_player.js", get(player_js_handler))
-        .nest_service("/audio", ServeDir::new(path.join("audio")))
-        .nest_service("/artwork", ServeDir::new(path.join("artwork")))
+        .fallback_service(ServeDir::new(&build_dir))
         .with_state(state);
 
-    // Start file watcher
-    let watcher_path = path.clone();
+    // Start file watcher with rebuild on change
+    let watcher_source = path.clone();
+    let watcher_build = build_dir.clone();
     let watcher_tx = reload_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = watch_files(watcher_path, watcher_tx).await {
+        if let Err(e) = watch_and_rebuild(watcher_source, watcher_build, watcher_tx).await {
             eprintln!("File watcher error: {}", e);
         }
     });
@@ -103,8 +108,12 @@ pub async fn run(path: PathBuf, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Watch for file changes and trigger reload
-async fn watch_files(path: PathBuf, reload_tx: broadcast::Sender<()>) -> Result<()> {
+/// Watch for file changes, rebuild, and trigger reload
+async fn watch_and_rebuild(
+    source_path: PathBuf,
+    build_path: PathBuf,
+    reload_tx: broadcast::Sender<()>,
+) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
     let mut watcher =
@@ -115,7 +124,7 @@ async fn watch_files(path: PathBuf, reload_tx: broadcast::Sender<()>) -> Result<
         })?;
 
     // Watch album directory recursively
-    watcher.watch(&path, RecursiveMode::Recursive)?;
+    watcher.watch(&source_path, RecursiveMode::Recursive)?;
 
     while let Some(event) = rx.recv().await {
         match event.kind {
@@ -125,8 +134,15 @@ async fn watch_files(path: PathBuf, reload_tx: broadcast::Sender<()>) -> Result<
                     let filename = p.file_name().unwrap_or_default().to_string_lossy();
                     !filename.starts_with('.') && !filename.ends_with('~')
                 }) {
-                    println!("   📝 File changed, reloading...");
-                    let _ = reload_tx.send(());
+                    println!("   📝 File changed, rebuilding...");
+
+                    // Rebuild the static site
+                    if let Err(e) = build_static_site(&source_path, &build_path, false) {
+                        eprintln!("   ❌ Build failed: {}", e);
+                    } else {
+                        println!("   ✓ Rebuilt, reloading browser...");
+                        let _ = reload_tx.send(());
+                    }
                 }
             }
             _ => {}
@@ -151,47 +167,4 @@ async fn sse_handler(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// Serve player JavaScript with cache headers
-async fn player_js_handler() -> Response {
-    (
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        generate_player_js(),
-    )
-        .into_response()
-}
-
-/// Main index page handler
-async fn index_handler(State(state): State<AppState>) -> Response {
-    // Load album config
-    let album_toml_path = state.album_path.join("album.toml");
-    let album = match parse_album_toml(&album_toml_path) {
-        Ok(a) => a,
-        Err(e) => {
-            return Html(format!(
-                r#"<!DOCTYPE html>
-<html><head><title>Error</title></head><body>
-<h1>Configuration Error</h1>
-<pre>{}</pre>
-</body></html>"#,
-                e
-            ))
-            .into_response();
-        }
-    };
-
-    // Detect cover art
-    let cover_art = detect_cover_art(&state.album_path.join("artwork"));
-
-    // Generate HTML using shared template
-    let html = generate_html(&album, cover_art.as_deref(), true);
-
-    Html(html).into_response()
 }
