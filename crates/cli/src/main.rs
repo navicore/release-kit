@@ -116,15 +116,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Preview { path, port } => commands::preview::run(path, port).await,
         Command::Build { path, output } => commands::build::run(path, output).await,
         Command::Deploy { command } => match command {
-            DeployCommand::Configure => {
-                commands::deploy::configure().await
-            }
-            DeployCommand::Publish { path, force } => {
-                commands::deploy::publish(path, force).await
-            }
-            DeployCommand::Status { path } => {
-                commands::deploy::status(path).await
-            }
+            DeployCommand::Configure => commands::deploy::configure().await,
+            DeployCommand::Publish { path, force } => commands::deploy::publish(path, force).await,
+            DeployCommand::Status { path } => commands::deploy::status(path).await,
             DeployCommand::Teardown { path, force } => {
                 commands::deploy::teardown(path, force).await
             }

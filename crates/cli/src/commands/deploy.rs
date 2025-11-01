@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use release_kit_core::config::parse_album_toml;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
-use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 use super::build::build_static_site;
 
@@ -42,20 +42,16 @@ fn load_config() -> Result<Option<GlobalConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path)
-        .context("Failed to read config file")?;
-    let config: GlobalConfig = toml::from_str(&contents)
-        .context("Failed to parse config file")?;
+    let contents = fs::read_to_string(&path).context("Failed to read config file")?;
+    let config: GlobalConfig = toml::from_str(&contents).context("Failed to parse config file")?;
     Ok(Some(config))
 }
 
 /// Save global config
 fn save_config(config: &GlobalConfig) -> Result<()> {
     let path = config_path()?;
-    let contents = toml::to_string_pretty(config)
-        .context("Failed to serialize config")?;
-    fs::write(&path, contents)
-        .context("Failed to write config file")?;
+    let contents = toml::to_string_pretty(config).context("Failed to serialize config")?;
+    fs::write(&path, contents).context("Failed to write config file")?;
     println!("✅ Configuration saved to: {}", path.display());
     Ok(())
 }
@@ -217,9 +213,7 @@ impl CloudflareClient {
             anyhow::bail!("Unknown Cloudflare API error");
         }
 
-        cf_response
-            .result
-            .context("No project returned from API")
+        cf_response.result.context("No project returned from API")
     }
 
     /// Upload static site files to Pages project (Direct Upload)
@@ -234,23 +228,17 @@ impl CloudflareClient {
         );
 
         // Read the zip file
-        let zip_bytes = std::fs::read(&zip_path)
-            .context("Failed to read deployment zip")?;
+        let zip_bytes = std::fs::read(&zip_path).context("Failed to read deployment zip")?;
 
         // Create multipart form
-        let form = reqwest::multipart::Form::new()
-            .part(
-                "file",
-                reqwest::multipart::Part::bytes(zip_bytes)
-                    .file_name("deployment.zip")
-                    .mime_str("application/zip")?,
-            );
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(zip_bytes)
+                .file_name("deployment.zip")
+                .mime_str("application/zip")?,
+        );
 
-        let response = self.client
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await?;
+        let response = self.client.post(&url).multipart(form).send().await?;
 
         let status = response.status();
         let response_text = response.text().await?;
@@ -294,10 +282,7 @@ impl CloudflareClient {
 
     /// Get DNS zone by domain name
     async fn get_dns_zone(&self, domain: &str) -> Result<Option<DnsZone>> {
-        let url = format!(
-            "https://api.cloudflare.com/client/v4/zones?name={}",
-            domain
-        );
+        let url = format!("https://api.cloudflare.com/client/v4/zones?name={}", domain);
 
         let response = self.client.get(&url).send().await?;
         let cf_response: CloudflareResponse<Vec<DnsZone>> = response.json().await?;
@@ -354,17 +339,13 @@ impl CloudflareClient {
 
 /// Create a zip file of the build directory for deployment
 fn create_deployment_zip(build_dir: &Path) -> Result<PathBuf> {
-    let zip_path = std::env::temp_dir().join(format!(
-        "release-kit-deploy-{}.zip",
-        std::process::id()
-    ));
+    let zip_path =
+        std::env::temp_dir().join(format!("release-kit-deploy-{}.zip", std::process::id()));
 
-    let file = File::create(&zip_path)
-        .context("Failed to create deployment zip file")?;
+    let file = File::create(&zip_path).context("Failed to create deployment zip file")?;
     let mut zip = ZipWriter::new(file);
 
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     // Walk the build directory and add all files
     for entry in WalkDir::new(build_dir)
@@ -373,14 +354,12 @@ fn create_deployment_zip(build_dir: &Path) -> Result<PathBuf> {
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path();
-        let relative_path = path.strip_prefix(build_dir)
+        let relative_path = path
+            .strip_prefix(build_dir)
             .context("Failed to get relative path")?;
 
         // Add file to zip
-        zip.start_file(
-            relative_path.to_string_lossy().to_string(),
-            options,
-        )?;
+        zip.start_file(relative_path.to_string_lossy().to_string(), options)?;
 
         let mut f = File::open(path)?;
         std::io::copy(&mut f, &mut zip)?;
@@ -421,11 +400,15 @@ pub async fn configure() -> Result<()> {
     println!();
 
     // Get API token
-    let default_token = existing.as_ref()
+    let default_token = existing
+        .as_ref()
         .map(|c| c.cloudflare.api_token.as_str())
         .unwrap_or("");
     let api_token = if !default_token.is_empty() {
-        let input = read_input(&format!("API Token [current: {}...]: ", &default_token[..10.min(default_token.len())]))?;
+        let input = read_input(&format!(
+            "API Token [current: {}...]: ",
+            &default_token[..10.min(default_token.len())]
+        ))?;
         if input.is_empty() {
             default_token.to_string()
         } else {
@@ -440,7 +423,8 @@ pub async fn configure() -> Result<()> {
     }
 
     // Get account ID
-    let default_account = existing.as_ref()
+    let default_account = existing
+        .as_ref()
         .map(|c| c.cloudflare.account_id.as_str())
         .unwrap_or("");
     let account_id = if !default_account.is_empty() {
@@ -459,12 +443,16 @@ pub async fn configure() -> Result<()> {
     }
 
     // Get base domain (optional)
-    let default_domain = existing.as_ref()
+    let default_domain = existing
+        .as_ref()
         .and_then(|c| c.cloudflare.base_domain.as_ref())
         .map(|s| s.as_str())
         .unwrap_or("");
     let base_domain_input = if !default_domain.is_empty() {
-        let input = read_input(&format!("Base Domain [current: {}] (press Enter to keep, 'none' to remove): ", default_domain))?;
+        let input = read_input(&format!(
+            "Base Domain [current: {}] (press Enter to keep, 'none' to remove): ",
+            default_domain
+        ))?;
         if input.is_empty() {
             Some(default_domain.to_string())
         } else if input.eq_ignore_ascii_case("none") {
@@ -474,11 +462,7 @@ pub async fn configure() -> Result<()> {
         }
     } else {
         let input = read_input("Base Domain (optional, press Enter to skip): ")?;
-        if input.is_empty() {
-            None
-        } else {
-            Some(input)
-        }
+        if input.is_empty() { None } else { Some(input) }
     };
 
     // Create config
@@ -539,13 +523,13 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
     println!();
 
     // Load global config
-    let config = load_config()?.context(
-        "No Cloudflare configuration found.\nRun 'release-kit deploy configure' first",
-    )?;
+    let config = load_config()?
+        .context("No Cloudflare configuration found.\nRun 'release-kit deploy configure' first")?;
 
     // Check if project exists via API
     println!("🔍 Checking deployment status...");
-    let client = CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
+    let client =
+        CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
 
     let project_exists = match client.get_pages_project(&project_name).await? {
         Some(_) => {
@@ -596,7 +580,10 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
     println!();
 
     // Set up custom domain if configured
-    if let (Some(subdomain), Some(base_domain)) = (&album.hosting.cloudflare.subdomain, &config.cloudflare.base_domain) {
+    if let (Some(subdomain), Some(base_domain)) = (
+        &album.hosting.cloudflare.subdomain,
+        &config.cloudflare.base_domain,
+    ) {
         println!("🌐 Setting up custom domain...");
         let full_domain = format!("{}.{}", subdomain, base_domain);
 
@@ -607,13 +594,18 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
 
                 // Create CNAME record
                 let target = format!("{}.pages.dev", project_name);
-                match client.create_dns_record(&zone.id, &full_domain, &target).await {
+                match client
+                    .create_dns_record(&zone.id, &full_domain, &target)
+                    .await
+                {
                     Ok(_) => {
                         println!("   ✓ Created DNS record: {} → {}", full_domain, target);
                     }
                     Err(e) => {
                         println!("   ⚠️  DNS record creation failed: {}", e);
-                        println!("   💡 You may need to create it manually in Cloudflare dashboard");
+                        println!(
+                            "   💡 You may need to create it manually in Cloudflare dashboard"
+                        );
                     }
                 }
             }
@@ -627,8 +619,14 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
 
     println!("✅ Deployment complete!");
     println!("   Live URL: {}", deployment_url);
-    if let (Some(subdomain), Some(base_domain)) = (&album.hosting.cloudflare.subdomain, &config.cloudflare.base_domain) {
-        println!("   Custom domain: https://{}.{} (DNS propagation may take a few minutes)", subdomain, base_domain);
+    if let (Some(subdomain), Some(base_domain)) = (
+        &album.hosting.cloudflare.subdomain,
+        &config.cloudflare.base_domain,
+    ) {
+        println!(
+            "   Custom domain: https://{}.{} (DNS propagation may take a few minutes)",
+            subdomain, base_domain
+        );
     }
 
     Ok(())
@@ -659,13 +657,13 @@ pub async fn status(path: Option<PathBuf>) -> Result<()> {
     println!();
 
     // Load global config
-    let config = load_config()?.context(
-        "No Cloudflare configuration found.\nRun 'release-kit deploy configure' first",
-    )?;
+    let config = load_config()?
+        .context("No Cloudflare configuration found.\nRun 'release-kit deploy configure' first")?;
 
     // Query Cloudflare API
     println!("☁️  Cloudflare Pages Status:");
-    let client = CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
+    let client =
+        CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
 
     match client.get_pages_project(&project_name).await? {
         Some(project) => {
@@ -684,7 +682,10 @@ pub async fn status(path: Option<PathBuf>) -> Result<()> {
         }
         None => {
             println!("   ❌ Status: Not deployed");
-            println!("   Run 'release-kit deploy publish {}' to deploy", path.display());
+            println!(
+                "   Run 'release-kit deploy publish {}' to deploy",
+                path.display()
+            );
         }
     }
     println!();
@@ -719,13 +720,13 @@ pub async fn teardown(path: PathBuf, force: bool) -> Result<()> {
     println!();
 
     // Load global config
-    let config = load_config()?.context(
-        "No Cloudflare configuration found.\nRun 'release-kit deploy configure' first",
-    )?;
+    let config = load_config()?
+        .context("No Cloudflare configuration found.\nRun 'release-kit deploy configure' first")?;
 
     // Check if project exists via API
     println!("🔍 Checking if project exists...");
-    let client = CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
+    let client =
+        CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
 
     match client.get_pages_project(&project_name).await? {
         Some(_) => {
@@ -801,10 +802,7 @@ mod tests {
 
     #[test]
     fn test_derive_project_name_hyphens() {
-        assert_eq!(
-            derive_project_name("Jay-Z", "The-Album"),
-            "jay-z-the-album"
-        );
+        assert_eq!(derive_project_name("Jay-Z", "The-Album"), "jay-z-the-album");
     }
 
     #[test]
