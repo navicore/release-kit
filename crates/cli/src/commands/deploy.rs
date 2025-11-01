@@ -105,7 +105,7 @@ struct CloudflareResponse<T> {
 
 #[derive(Debug, Deserialize)]
 struct CloudflareError {
-    code: i32,
+    _code: i32,
     message: String,
 }
 
@@ -126,7 +126,7 @@ struct PagesProject {
 #[derive(Debug, Deserialize)]
 struct DnsZone {
     id: String,
-    name: String,
+    _name: String,
 }
 
 /// DNS Record
@@ -671,12 +671,12 @@ pub async fn status(path: Option<PathBuf>) -> Result<()> {
             println!("   Created: {}", project.created_on);
             println!("   URL: https://{}.pages.dev", project_name);
 
-            if let Some(domains) = &project.domains {
-                if !domains.is_empty() {
-                    println!("   Custom Domains:");
-                    for domain in domains {
-                        println!("     - https://{}", domain);
-                    }
+            if let Some(domains) = &project.domains
+                && !domains.is_empty()
+            {
+                println!("   Custom Domains:");
+                for domain in domains {
+                    println!("     - https://{}", domain);
                 }
             }
         }
