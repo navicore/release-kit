@@ -108,6 +108,9 @@ pub struct CloudflareConfig {
     pub account_id: String,
     pub r2_bucket: String,
     pub pages_project: String,
+    /// Custom subdomain for album (e.g., "my-album" -> my-album.yourdomain.com)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subdomain: Option<String>,
 }
 
 /// Bandwidth limits
