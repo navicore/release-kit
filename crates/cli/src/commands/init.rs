@@ -406,10 +406,10 @@ fn generate_album_toml(
     let today = Local::now().format("%Y-%m-%d").to_string();
 
     // Validate email if provided
-    if let Some(e) = email {
-        if !is_valid_email(e) {
-            anyhow::bail!("Invalid email format: '{}'", e);
-        }
+    if let Some(e) = email
+        && !is_valid_email(e)
+    {
+        anyhow::bail!("Invalid email format: '{}'", e);
     }
 
     // Escape user input for safe TOML inclusion
