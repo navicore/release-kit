@@ -105,12 +105,17 @@ pub struct HostingConfig {
 /// Cloudflare-specific hosting config
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudflareConfig {
-    pub account_id: String,
-    pub r2_bucket: String,
-    pub pages_project: String,
     /// Custom subdomain for album (e.g., "my-album" -> my-album.yourdomain.com)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subdomain: Option<String>,
+
+    // Deprecated fields (kept for backward compatibility)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r2_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages_project: Option<String>,
 }
 
 /// Bandwidth limits
