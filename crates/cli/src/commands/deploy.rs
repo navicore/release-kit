@@ -5,12 +5,18 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 use super::build::build_static_site;
+
+// Constants
+const DEFAULT_BRANCH: &str = "main";
+const DNS_RECORD_TYPE: &str = "CNAME";
+const HTTP_TIMEOUT_SECS: u64 = 300; // 5 minutes for large uploads
 
 /// Global configuration for deployments
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +158,7 @@ impl CloudflareClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()?;
 
         Ok(Self {
@@ -200,7 +207,7 @@ impl CloudflareClient {
 
         let request = CreateProjectRequest {
             name: project_name.to_string(),
-            production_branch: "main".to_string(),
+            production_branch: DEFAULT_BRANCH.to_string(),
         };
 
         let response = self.client.post(&url).json(&request).send().await?;
@@ -311,7 +318,7 @@ impl CloudflareClient {
 
         let record = DnsRecord {
             id: None,
-            record_type: "CNAME".to_string(),
+            record_type: DNS_RECORD_TYPE.to_string(),
             name: name.to_string(),
             content: target.to_string(),
             proxied: true, // Enable Cloudflare proxy for HTTPS
@@ -509,6 +516,15 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
     let album = parse_album_toml(&album_toml_path).context("Failed to parse album.toml")?;
     let project_name = derive_project_name(&album.artist.name, &album.metadata.title);
 
+    // Validate project name is not empty or invalid
+    if project_name.is_empty() || project_name == "-" {
+        anyhow::bail!(
+            "Invalid album/artist names - cannot create project name.\nAlbum: '{}', Artist: '{}'",
+            album.metadata.title,
+            album.artist.name
+        );
+    }
+
     // Get subdomain from album config if specified
     let subdomain = album.hosting.cloudflare.subdomain.clone();
 
@@ -650,6 +666,15 @@ pub async fn status(path: Option<PathBuf>) -> Result<()> {
     let album = parse_album_toml(&album_toml_path).context("Failed to parse album.toml")?;
     let project_name = derive_project_name(&album.artist.name, &album.metadata.title);
 
+    // Validate project name is not empty or invalid
+    if project_name.is_empty() || project_name == "-" {
+        anyhow::bail!(
+            "Invalid album/artist names - cannot derive project name.\nAlbum: '{}', Artist: '{}'",
+            album.metadata.title,
+            album.artist.name
+        );
+    }
+
     println!("📋 Project Information:");
     println!("   Album: {}", album.metadata.title);
     println!("   Artist: {}", album.artist.name);
@@ -712,6 +737,15 @@ pub async fn teardown(path: PathBuf, force: bool) -> Result<()> {
 
     let album = parse_album_toml(&album_toml_path).context("Failed to parse album.toml")?;
     let project_name = derive_project_name(&album.artist.name, &album.metadata.title);
+
+    // Validate project name is not empty or invalid
+    if project_name.is_empty() || project_name == "-" {
+        anyhow::bail!(
+            "Invalid album/artist names - cannot derive project name.\nAlbum: '{}', Artist: '{}'",
+            album.metadata.title,
+            album.artist.name
+        );
+    }
 
     println!("⚠️  WARNING: This will permanently delete:");
     println!("   Project: {}", project_name);
@@ -811,5 +845,17 @@ mod tests {
             derive_project_name("Blink 182", "Album 2023"),
             "blink-182-album-2023"
         );
+    }
+
+    #[test]
+    fn test_derive_project_name_all_special_chars() {
+        // Edge case: only special characters results in hyphen separator only
+        assert_eq!(derive_project_name("!!!", "???"), "-");
+    }
+
+    #[test]
+    fn test_derive_project_name_empty_strings() {
+        // Edge case: empty strings result in hyphen separator only
+        assert_eq!(derive_project_name("", ""), "-");
     }
 }
