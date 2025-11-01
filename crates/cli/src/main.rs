@@ -49,12 +49,8 @@ enum Command {
 
     /// Deploy site to hosting platform
     Deploy {
-        /// Path to album directory
-        path: PathBuf,
-
-        /// Deployment target
-        #[arg(short, long, default_value = "cloudflare")]
-        target: DeployTarget,
+        #[command(subcommand)]
+        command: DeployCommand,
     },
 
     /// Generate shell completion scripts
@@ -62,6 +58,45 @@ enum Command {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
+    },
+}
+
+#[derive(Parser)]
+enum DeployCommand {
+    /// Configure Cloudflare credentials and base domain
+    ///
+    /// Required API Token Permissions:
+    ///   Account > Cloudflare Pages > Edit
+    ///   Zone > DNS > Edit (for custom domains)
+    ///   Zone > Zone > Read (for custom domains)
+    ///
+    /// Create token at: https://dash.cloudflare.com/profile/api-tokens
+    Configure,
+
+    /// Publish album to Cloudflare Pages
+    Publish {
+        /// Path to album directory
+        path: PathBuf,
+
+        /// Skip confirmation prompts
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Show deployment status and info
+    Status {
+        /// Path to album directory (optional - scans current dir)
+        path: Option<PathBuf>,
+    },
+
+    /// Delete deployment from Cloudflare Pages
+    Teardown {
+        /// Path to album directory
+        path: PathBuf,
+
+        /// Skip confirmation prompt (dangerous!)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -80,7 +115,20 @@ async fn main() -> anyhow::Result<()> {
         Command::Validate { path } => commands::validate::run(path).await,
         Command::Preview { path, port } => commands::preview::run(path, port).await,
         Command::Build { path, output } => commands::build::run(path, output).await,
-        Command::Deploy { path, target } => commands::deploy::run(path, target).await,
+        Command::Deploy { command } => match command {
+            DeployCommand::Configure => {
+                commands::deploy::configure().await
+            }
+            DeployCommand::Publish { path, force } => {
+                commands::deploy::publish(path, force).await
+            }
+            DeployCommand::Status { path } => {
+                commands::deploy::status(path).await
+            }
+            DeployCommand::Teardown { path, force } => {
+                commands::deploy::teardown(path, force).await
+            }
+        },
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "release-kit", &mut io::stdout());

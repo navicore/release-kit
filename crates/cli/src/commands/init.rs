@@ -433,6 +433,7 @@ download_formats = ["flac", "mp3-320"]
 account_id = "your-cloudflare-account-id"  # TODO: Set from env or config
 r2_bucket = "music-releases"
 pages_project = "my-album"
+subdomain = "my-album"  # Custom subdomain (e.g., "my-album" -> my-album.yourdomain.com)
 
 [rss]
 enabled = true
