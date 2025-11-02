@@ -3636,6 +3636,7 @@ dependencies = [
  "clap_complete",
  "futures",
  "lofty",
+ "mime_guess",
  "notify",
  "release-kit-core",
  "release-kit-deployer",
