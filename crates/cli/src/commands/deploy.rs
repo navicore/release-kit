@@ -75,9 +75,11 @@ fn save_config(config: &GlobalConfig) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, permissions)
-            .context("Failed to set secure file permissions")?;
-        println!("✅ Configuration saved to: {} (permissions: 0600)", path.display());
+        fs::set_permissions(&path, permissions).context("Failed to set secure file permissions")?;
+        println!(
+            "✅ Configuration saved to: {} (permissions: 0600)",
+            path.display()
+        );
     }
 
     #[cfg(not(unix))]
@@ -581,7 +583,10 @@ fn validate_api_token(token: &str) -> Result<()> {
     if token.len() < 20 {
         anyhow::bail!("API token appears too short (expected 40+ characters)");
     }
-    if !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         anyhow::bail!("API token contains invalid characters");
     }
     Ok(())
@@ -622,7 +627,10 @@ fn validate_domain(domain: &str) -> Result<()> {
     }
 
     // Check for invalid characters
-    if !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+    if !domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
         anyhow::bail!("Domain contains invalid characters (only a-z, 0-9, '.', '-' allowed)");
     }
 
@@ -694,8 +702,7 @@ pub async fn configure() -> Result<()> {
     };
 
     // Validate API token
-    validate_api_token(&api_token)
-        .context("Invalid API token format - please check your token")?;
+    validate_api_token(&api_token).context("Invalid API token format - please check your token")?;
 
     // Get account ID
     let default_account = existing
@@ -731,8 +738,7 @@ pub async fn configure() -> Result<()> {
         if input.is_empty() {
             Some(default_r2_key.to_string())
         } else {
-            validate_r2_access_key(&input)
-                .context("Invalid R2 access key format")?;
+            validate_r2_access_key(&input).context("Invalid R2 access key format")?;
             Some(input)
         }
     } else {
@@ -740,8 +746,7 @@ pub async fn configure() -> Result<()> {
         if input.is_empty() {
             None
         } else {
-            validate_r2_access_key(&input)
-                .context("Invalid R2 access key format")?;
+            validate_r2_access_key(&input).context("Invalid R2 access key format")?;
             Some(input)
         }
     };
@@ -792,8 +797,7 @@ pub async fn configure() -> Result<()> {
         } else if input.eq_ignore_ascii_case("none") {
             None
         } else {
-            validate_domain(&input)
-                .context("Invalid domain format")?;
+            validate_domain(&input).context("Invalid domain format")?;
             Some(input)
         }
     } else {
@@ -801,8 +805,7 @@ pub async fn configure() -> Result<()> {
         if input.is_empty() {
             None
         } else {
-            validate_domain(&input)
-                .context("Invalid domain format")?;
+            validate_domain(&input).context("Invalid domain format")?;
             Some(input)
         }
     };
