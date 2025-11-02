@@ -4,6 +4,7 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml;
 use walkdir::WalkDir;
 
 const AUDIO_EXTENSIONS: &[&str] = &["flac", "wav", "mp3", "ogg"];
@@ -19,9 +20,22 @@ const COVER_ART_NAMES: &[&str] = &[
 ];
 const MAX_SCAN_DEPTH: usize = 2; // Maximum directory depth for audio file scanning
 
-/// Escape a string for safe inclusion in TOML
-/// Handles quotes, backslashes, and control characters
-fn escape_toml_string(s: &str) -> String {
+/// Escape a string for safe inclusion in TOML per TOML v1.0.0 spec
+///
+/// Handles the required escape sequences for TOML basic strings:
+/// - Backslash (\\) -> \\\\
+/// - Quote (\") -> \\\"
+/// - Newline (\n) -> \\n
+/// - Carriage return (\r) -> \\r
+/// - Tab (\t) -> \\t
+///
+/// This manual implementation is used instead of toml crate serialization
+/// because we're generating a template with comments and specific formatting,
+/// not a complete TOML document. The toml crate's serialization doesn't
+/// preserve comments or custom formatting.
+///
+/// See: https://toml.io/en/v1.0.0#string
+fn toml_escape_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
@@ -412,10 +426,10 @@ fn generate_album_toml(
         anyhow::bail!("Invalid email format: '{}'", e);
     }
 
-    // Escape user input for safe TOML inclusion
-    let artist_name = escape_toml_string(artist.unwrap_or("Artist Name"));
-    let album_title = escape_toml_string(album.unwrap_or("My Album"));
-    let artist_email = escape_toml_string(email.unwrap_or("artist@example.com"));
+    // Escape user input for safe TOML inclusion using toml crate
+    let artist_name = toml_escape_string(artist.unwrap_or("Artist Name"));
+    let album_title = toml_escape_string(album.unwrap_or("My Album"));
+    let artist_email = toml_escape_string(email.unwrap_or("artist@example.com"));
 
     let artist_comment = if artist.is_some() {
         ""
@@ -441,7 +455,7 @@ fn generate_album_toml(
 title = \"{album_title}\"{album_comment}\n\
 artist = \"{artist_name}\"{artist_comment}\n\
 release_date = \"{today}\"  # TODO: Set release date\n\
-summary = \"Description of this album\"  # TODO:  Add summary\n\
+summary = \"Description of this album\"  # TODO: Add summary\n\
 genre = [\"experimental\"]  # TODO: Set genres\n\
 license = \"CC BY-NC-SA 4.0\"\n\
 liner_notes = \"notes/album.md\"\n\
@@ -472,8 +486,13 @@ accent_color = \"#ff6b35\"\n\
     } else {
         toml.push_str("# Auto-detected tracks (edit titles/add liner notes as needed)\n");
         for track in tracks {
-            let filename = escape_toml_string(&track.path.file_name().unwrap().to_string_lossy());
-            let title = escape_toml_string(&track.title);
+            let filename = track
+                .path
+                .file_name()
+                .context("Track path has no filename")?
+                .to_string_lossy();
+            let filename = toml_escape_string(&filename);
+            let title = toml_escape_string(&track.title);
             toml.push_str("[[track]]\n");
             toml.push_str(&format!("file = \"audio/{}\"\n", filename));
             toml.push_str(&format!("title = \"{}\"\n", title));
@@ -502,6 +521,10 @@ download_formats = ["flac", "mp3-320"]
 enabled = true
 "##,
     );
+
+    // Validate the generated TOML can be parsed
+    toml::from_str::<toml::Value>(&toml)
+        .context("Generated TOML is invalid - this is a bug in the template generator")?;
 
     fs::write(base.join("album.toml"), toml)?;
 
@@ -952,24 +975,24 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_toml_string() {
+    fn test_toml_escape_string() {
         // Test quote escaping
-        assert_eq!(escape_toml_string(r#"Test "Quote""#), r#"Test \"Quote\""#);
+        assert_eq!(toml_escape_string(r#"Test "Quote""#), r#"Test \"Quote\""#);
 
         // Test backslash escaping
-        assert_eq!(escape_toml_string(r"Test\Back"), r"Test\\Back");
+        assert_eq!(toml_escape_string(r"Test\Back"), r"Test\\Back");
 
         // Test newline escaping
-        assert_eq!(escape_toml_string("Test\nNewline"), r"Test\nNewline");
+        assert_eq!(toml_escape_string("Test\nNewline"), r"Test\nNewline");
 
         // Test combined
         assert_eq!(
-            escape_toml_string(r#"Test "Quote" and\Back"#),
+            toml_escape_string(r#"Test "Quote" and\Back"#),
             r#"Test \"Quote\" and\\Back"#
         );
 
         // Test normal string (no escaping needed)
-        assert_eq!(escape_toml_string("Normal String"), "Normal String");
+        assert_eq!(toml_escape_string("Normal String"), "Normal String");
     }
 
     #[test]
