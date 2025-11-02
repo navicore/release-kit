@@ -35,3 +35,6 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 zip = "2"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
