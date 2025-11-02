@@ -25,6 +25,8 @@ const MAX_SCAN_DEPTH: usize = 2; // Maximum directory depth for audio file scann
 /// Handles the required escape sequences for TOML basic strings:
 /// - Backslash (\\) -> \\\\
 /// - Quote (\") -> \\\"
+/// - Backspace (\b) -> \\b
+/// - Form feed (\f) -> \\f
 /// - Newline (\n) -> \\n
 /// - Carriage return (\r) -> \\r
 /// - Tab (\t) -> \\t
@@ -38,6 +40,8 @@ const MAX_SCAN_DEPTH: usize = 2; // Maximum directory depth for audio file scann
 fn toml_escape_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
+        .replace('\x08', "\\b")
+        .replace('\x0C', "\\f")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
@@ -464,10 +468,12 @@ fn generate_album_toml(
     let today = Local::now().format("%Y-%m-%d").to_string();
 
     // Validate email if provided
-    if let Some(e) = email
-        && !is_valid_email(e)
-    {
-        anyhow::bail!("Invalid email format: '{}'", e);
+    // Note: We use nested if instead of if-let chains for broader Rust version compatibility
+    #[allow(clippy::collapsible_if)]
+    if let Some(e) = email {
+        if !is_valid_email(e) {
+            anyhow::bail!("Invalid email format: '{}'", e);
+        }
     }
 
     // Escape user input for safe TOML inclusion using toml crate
