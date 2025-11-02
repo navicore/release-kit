@@ -64,7 +64,7 @@ pub async fn run(path: PathBuf, port: u16) -> Result<()> {
     let _temp_dir = TempDir::new().context("Failed to create temporary directory")?;
     let build_dir = _temp_dir.path();
     println!("📦 Building static site to temp directory...");
-    build_static_site(&path, build_dir, false)
+    build_static_site(&path, build_dir, false, None)
         .context("Failed to build static site for preview")?;
     println!("   ✓ Built to: {}", build_dir.display());
 
@@ -143,7 +143,7 @@ async fn watch_and_rebuild(
                     println!("   📝 File changed, rebuilding...");
 
                     // Rebuild the static site
-                    if let Err(e) = build_static_site(&source_path, &build_path, false) {
+                    if let Err(e) = build_static_site(&source_path, &build_path, false, None) {
                         eprintln!("   ❌ Build failed: {}", e);
                     } else {
                         println!("   ✓ Rebuilt, reloading browser...");

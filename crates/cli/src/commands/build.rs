@@ -9,7 +9,19 @@ use super::template::{detect_cover_art, generate_html, generate_player_js};
 ///
 /// This is the core build logic used by both `build` and `preview` commands.
 /// It generates a complete static site in the output directory.
-pub fn build_static_site(path: &Path, output: &Path, verbose: bool) -> Result<()> {
+///
+/// # Arguments
+///
+/// * `path` - Source album directory
+/// * `output` - Output directory for built site
+/// * `verbose` - Enable verbose logging
+/// * `audio_base_url` - Optional CDN URL for audio files (skips audio copy if provided)
+pub fn build_static_site(
+    path: &Path,
+    output: &Path,
+    verbose: bool,
+    audio_base_url: Option<&str>,
+) -> Result<()> {
     // Validate album directory exists
     if !path.exists() {
         anyhow::bail!("Album directory does not exist: {}", path.display());
@@ -46,25 +58,32 @@ pub fn build_static_site(path: &Path, output: &Path, verbose: bool) -> Result<()
         println!("   ✓ Created directories");
     }
 
-    // Copy audio files
-    if verbose {
-        println!("🎵 Copying audio files...");
-    }
-    let mut copied_audio = 0;
-    for track in &album.tracks {
-        let src = path.join(&track.file);
-        let filename = track.file.file_name().context("Invalid track filename")?;
-        let dst = output.join("audio").join(filename);
-
-        if src.exists() {
-            fs::copy(&src, &dst).with_context(|| format!("Failed to copy {}", src.display()))?;
-            copied_audio += 1;
-        } else {
-            eprintln!("   ⚠ Warning: Audio file not found: {}", src.display());
+    // Copy audio files (skip if using CDN)
+    if audio_base_url.is_some() {
+        if verbose {
+            println!("🎵 Skipping audio copy (using CDN)");
         }
-    }
-    if verbose {
-        println!("   ✓ Copied {} audio files", copied_audio);
+    } else {
+        if verbose {
+            println!("🎵 Copying audio files...");
+        }
+        let mut copied_audio = 0;
+        for track in &album.tracks {
+            let src = path.join(&track.file);
+            let filename = track.file.file_name().context("Invalid track filename")?;
+            let dst = output.join("audio").join(filename);
+
+            if src.exists() {
+                fs::copy(&src, &dst)
+                    .with_context(|| format!("Failed to copy {}", src.display()))?;
+                copied_audio += 1;
+            } else {
+                eprintln!("   ⚠ Warning: Audio file not found: {}", src.display());
+            }
+        }
+        if verbose {
+            println!("   ✓ Copied {} audio files", copied_audio);
+        }
     }
 
     // Copy artwork
@@ -119,7 +138,7 @@ pub fn build_static_site(path: &Path, output: &Path, verbose: bool) -> Result<()
         println!("📄 Generating index.html...");
     }
     let cover_art = detect_cover_art(&path.join("artwork"));
-    let html = generate_html(&album, cover_art.as_deref(), false);
+    let html = generate_html(&album, cover_art.as_deref(), false, audio_base_url);
     fs::write(output.join("index.html"), html).context("Failed to write index.html")?;
     if verbose {
         println!("   ✓ Generated index.html");
@@ -145,7 +164,7 @@ pub async fn run(path: PathBuf, output: PathBuf) -> Result<()> {
     println!("   Output: {}", output.display());
     println!();
 
-    build_static_site(&path, &output, true)?;
+    build_static_site(&path, &output, true, None)?;
 
     println!();
     println!("✅ Build complete!");

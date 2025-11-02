@@ -66,7 +66,19 @@ pub fn format_duration(duration: std::time::Duration) -> String {
 ///
 /// This template is shared between preview and build commands to ensure
 /// what you see in preview is exactly what gets deployed.
-pub fn generate_html(album: &Album, cover_art: Option<&str>, is_preview: bool) -> String {
+///
+/// # Arguments
+///
+/// * `album` - Album configuration
+/// * `cover_art` - Optional cover art filename
+/// * `is_preview` - Whether this is for preview mode (adds SSE reload)
+/// * `audio_base_url` - Optional CDN base URL for audio files (e.g., "https://cdn.example.com")
+pub fn generate_html(
+    album: &Album,
+    cover_art: Option<&str>,
+    is_preview: bool,
+    audio_base_url: Option<&str>,
+) -> String {
     // Generate track list HTML with data attributes for player
     let tracks_html: String = album
         .tracks
@@ -88,14 +100,21 @@ pub fn generate_html(album: &Album, cover_art: Option<&str>, is_preview: bool) -
             let escaped_filename = html_escape(filename);
             let escaped_title = html_escape(&track.title);
 
+            // Construct audio URL: use CDN if provided, otherwise local /audio/
+            let audio_url = if let Some(base_url) = audio_base_url {
+                format!("{}/audio/{}", base_url, escaped_filename)
+            } else {
+                format!("/audio/{}", escaped_filename)
+            };
+
             format!(
-                r#"<div class="track" data-index="{}" data-src="/audio/{}" data-title="{}">
+                r#"<div class="track" data-index="{}" data-src="{}" data-title="{}">
                     <span class="track-number">{:02}</span>
                     <span class="track-title">{}</span>
                     <span class="track-duration">{}</span>
                 </div>"#,
                 i,
-                escaped_filename,
+                audio_url,
                 escaped_title,
                 i + 1,
                 escaped_title,
