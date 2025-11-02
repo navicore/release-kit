@@ -4,6 +4,7 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml;
 use walkdir::WalkDir;
 
 const AUDIO_EXTENSIONS: &[&str] = &["flac", "wav", "mp3", "ogg"];
@@ -18,6 +19,86 @@ const COVER_ART_NAMES: &[&str] = &[
     "album.png",
 ];
 const MAX_SCAN_DEPTH: usize = 2; // Maximum directory depth for audio file scanning
+
+/// Escape a string for safe inclusion in TOML per TOML v1.0.0 spec
+///
+/// Handles the required escape sequences for TOML basic strings:
+/// - Backslash (\\) -> \\\\
+/// - Quote (\") -> \\\"
+/// - Backspace (\b) -> \\b
+/// - Form feed (\f) -> \\f
+/// - Newline (\n) -> \\n
+/// - Carriage return (\r) -> \\r
+/// - Tab (\t) -> \\t
+///
+/// This manual implementation is used instead of toml crate serialization
+/// because we're generating a template with comments and specific formatting,
+/// not a complete TOML document. The toml crate's serialization doesn't
+/// preserve comments or custom formatting.
+///
+/// See: https://toml.io/en/v1.0.0#string
+fn toml_escape_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\x08', "\\b")
+        .replace('\x0C', "\\f")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Validate email format
+/// Checks for basic RFC 5322 compliance without full regex
+fn is_valid_email(email: &str) -> bool {
+    // Must have exactly one @ symbol
+    let at_count = email.matches('@').count();
+    if at_count != 1 {
+        return false;
+    }
+
+    let parts: Vec<&str> = email.split('@').collect();
+    let local = parts[0];
+    let domain = parts[1];
+
+    // Local part (before @) checks
+    if local.is_empty() || local.len() > 64 {
+        return false;
+    }
+
+    // Domain checks
+    if domain.is_empty() || domain.len() > 255 {
+        return false;
+    }
+
+    // Domain must have at least one dot
+    if !domain.contains('.') {
+        return false;
+    }
+
+    // Domain can't start/end with dot or hyphen
+    if domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.starts_with('-')
+        || domain.ends_with('-')
+    {
+        return false;
+    }
+
+    // No consecutive dots
+    if domain.contains("..") {
+        return false;
+    }
+
+    // Domain must have valid TLD (at least 2 chars after last dot)
+    if let Some(last_dot) = domain.rfind('.') {
+        let tld = &domain[last_dot + 1..];
+        if tld.len() < 2 {
+            return false;
+        }
+    }
+
+    true
+}
 
 #[derive(Debug)]
 struct DetectedTrack {
@@ -59,7 +140,12 @@ struct DetectedTrack {
 /// # Ok(())
 /// # }
 /// ```
-pub async fn run(path: PathBuf) -> Result<()> {
+pub async fn run(
+    path: PathBuf,
+    artist: Option<String>,
+    album: Option<String>,
+    email: Option<String>,
+) -> Result<()> {
     println!("Initializing album directory: {}", path.display());
 
     if !path.exists() {
@@ -109,7 +195,13 @@ pub async fn run(path: PathBuf) -> Result<()> {
     organize_files(&path, &audio_files, &cover_art)?;
 
     // Generate album.toml
-    generate_album_toml(&path, &tracks)?;
+    generate_album_toml(
+        &path,
+        &tracks,
+        artist.as_deref(),
+        album.as_deref(),
+        email.as_deref(),
+    )?;
 
     // Generate template notes
     generate_notes_template(&path)?;
@@ -307,7 +399,7 @@ fn create_directory_structure(base: &Path) -> Result<()> {
 
 fn create_empty_structure(base: &Path) -> Result<()> {
     create_directory_structure(base)?;
-    generate_album_toml(base, &[])?;
+    generate_album_toml(base, &[], None, None, None)?;
     generate_notes_template(base)?;
 
     println!("\n✓ Created empty structure");
@@ -366,33 +458,68 @@ fn organize_files(base: &Path, audio_files: &[PathBuf], cover_art: &Option<PathB
     Ok(())
 }
 
-fn generate_album_toml(base: &Path, tracks: &[DetectedTrack]) -> Result<()> {
+fn generate_album_toml(
+    base: &Path,
+    tracks: &[DetectedTrack],
+    artist: Option<&str>,
+    album: Option<&str>,
+    email: Option<&str>,
+) -> Result<()> {
     let today = Local::now().format("%Y-%m-%d").to_string();
 
+    // Validate email if provided
+    // Note: We use nested if instead of if-let chains for broader Rust version compatibility
+    #[allow(clippy::collapsible_if)]
+    if let Some(e) = email {
+        if !is_valid_email(e) {
+            anyhow::bail!("Invalid email format: '{}'", e);
+        }
+    }
+
+    // Escape user input for safe TOML inclusion using toml crate
+    let artist_name = toml_escape_string(artist.unwrap_or("Artist Name"));
+    let album_title = toml_escape_string(album.unwrap_or("My Album"));
+    let artist_email = toml_escape_string(email.unwrap_or("artist@example.com"));
+
+    let artist_comment = if artist.is_some() {
+        ""
+    } else {
+        "  # TODO: Set artist name"
+    };
+    let album_comment = if album.is_some() {
+        ""
+    } else {
+        "  # TODO: Set album title"
+    };
+    let email_comment = if email.is_some() {
+        ""
+    } else {
+        "  # TODO: Set email"
+    };
+
     let mut toml = format!(
-        r##"# Generated by release-kit init
-# Edit this file to customize your album
-
-[album]
-title = "My Album"  # TODO: Set album title
-artist = "Artist Name"  # TODO: Set artist name
-release_date = "{}"  # TODO: Set release date
-summary = "Description of this album"  # TODO: Add summary
-genre = ["experimental"]  # TODO: Set genres
-license = "CC BY-NC-SA 4.0"
-liner_notes = "notes/album.md"
-
-[artist]
-name = "Artist Name"  # TODO: Set artist name
-rss_author_email = "artist@example.com"  # TODO: Set email
-
-[site]
-domain = "my-album.example.com"  # TODO: Set domain
-theme = "default"
-accent_color = "#ff6b35"
-
-"##,
-        today
+        "# Generated by release-kit init\n\
+# Edit this file to customize your album\n\
+\n\
+[album]\n\
+title = \"{album_title}\"{album_comment}\n\
+artist = \"{artist_name}\"{artist_comment}\n\
+release_date = \"{today}\"  # TODO: Set release date\n\
+summary = \"Description of this album\"  # TODO: Add summary\n\
+genre = [\"experimental\"]  # TODO: Set genres\n\
+license = \"CC BY-NC-SA 4.0\"\n\
+liner_notes = \"notes/album.md\"\n\
+\n\
+[artist]\n\
+name = \"{artist_name}\"{artist_comment}\n\
+rss_author_email = \"{artist_email}\"{email_comment}\n\
+\n\
+[site]\n\
+domain = \"my-album.example.com\"  # TODO: Set domain\n\
+theme = \"default\"\n\
+accent_color = \"#ff6b35\"\n\
+\n\
+"
     );
 
     if tracks.is_empty() {
@@ -409,10 +536,16 @@ accent_color = "#ff6b35"
     } else {
         toml.push_str("# Auto-detected tracks (edit titles/add liner notes as needed)\n");
         for track in tracks {
-            let filename = track.path.file_name().unwrap().to_string_lossy();
+            let filename = track
+                .path
+                .file_name()
+                .context("Track path has no filename")?
+                .to_string_lossy();
+            let filename = toml_escape_string(&filename);
+            let title = toml_escape_string(&track.title);
             toml.push_str("[[track]]\n");
             toml.push_str(&format!("file = \"audio/{}\"\n", filename));
-            toml.push_str(&format!("title = \"{}\"\n", track.title));
+            toml.push_str(&format!("title = \"{}\"\n", title));
             if let Some(ref duration) = track.duration {
                 toml.push_str(&format!("duration = \"{}\"  # Auto-detected\n", duration));
             }
@@ -430,15 +563,18 @@ tip_jar_enabled = false
 download_formats = ["flac", "mp3-320"]
 
 [hosting.cloudflare]
-account_id = "your-cloudflare-account-id"  # TODO: Set from env or config
-r2_bucket = "music-releases"
-pages_project = "my-album"
-subdomain = "my-album"  # Custom subdomain (e.g., "my-album" -> my-album.yourdomain.com)
+# Optional: Custom subdomain for your domain (e.g., "my-album" -> my-album.yourdomain.com)
+# Leave empty to use the default .pages.dev domain
+# subdomain = "my-album"
 
 [rss]
 enabled = true
 "##,
     );
+
+    // Validate the generated TOML can be parsed
+    toml::from_str::<toml::Value>(&toml)
+        .context("Generated TOML is invalid - this is a bug in the template generator")?;
 
     fs::write(base.join("album.toml"), toml)?;
 
@@ -724,7 +860,7 @@ mod tests {
     #[test]
     fn test_generate_album_toml_empty_tracks() {
         let dir = TempDir::new().unwrap();
-        generate_album_toml(dir.path(), &[]).unwrap();
+        generate_album_toml(dir.path(), &[], None, None, None).unwrap();
 
         let toml_path = dir.path().join("album.toml");
         assert!(toml_path.exists(), "album.toml should be created");
@@ -754,7 +890,7 @@ mod tests {
             },
         ];
 
-        generate_album_toml(dir.path(), &tracks).unwrap();
+        generate_album_toml(dir.path(), &tracks, None, None, None).unwrap();
 
         let content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
         assert!(content.contains("[[track]]"));
@@ -769,7 +905,7 @@ mod tests {
     #[test]
     fn test_generate_album_toml_includes_required_sections() {
         let dir = TempDir::new().unwrap();
-        generate_album_toml(dir.path(), &[]).unwrap();
+        generate_album_toml(dir.path(), &[], None, None, None).unwrap();
 
         let content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
 
@@ -886,5 +1022,170 @@ mod tests {
         // Check files created
         assert!(dir.path().join("album.toml").exists());
         assert!(dir.path().join("notes").join("album.md").exists());
+    }
+
+    #[test]
+    fn test_toml_escape_string() {
+        // Test quote escaping
+        assert_eq!(toml_escape_string(r#"Test "Quote""#), r#"Test \"Quote\""#);
+
+        // Test backslash escaping
+        assert_eq!(toml_escape_string(r"Test\Back"), r"Test\\Back");
+
+        // Test newline escaping
+        assert_eq!(toml_escape_string("Test\nNewline"), r"Test\nNewline");
+
+        // Test combined
+        assert_eq!(
+            toml_escape_string(r#"Test "Quote" and\Back"#),
+            r#"Test \"Quote\" and\\Back"#
+        );
+
+        // Test normal string (no escaping needed)
+        assert_eq!(toml_escape_string("Normal String"), "Normal String");
+    }
+
+    #[test]
+    fn test_is_valid_email() {
+        // Valid emails
+        assert!(is_valid_email("user@example.com"));
+        assert!(is_valid_email("test.user@domain.co.uk"));
+        assert!(is_valid_email("name+tag@example.org"));
+
+        // Invalid emails - missing @
+        assert!(!is_valid_email("user"));
+        assert!(!is_valid_email(""));
+
+        // Invalid emails - multiple @
+        assert!(!is_valid_email("user@@example.com"));
+        assert!(!is_valid_email("user@name@example.com"));
+
+        // Invalid emails - missing parts
+        assert!(!is_valid_email("@example.com"));
+        assert!(!is_valid_email("user@"));
+
+        // Invalid emails - invalid domain
+        assert!(!is_valid_email("user@domain")); // No TLD
+        assert!(!is_valid_email("user@.com")); // Domain starts with dot
+        assert!(!is_valid_email("user@domain.")); // Domain ends with dot
+        assert!(!is_valid_email("user@domain.c")); // TLD too short
+        assert!(!is_valid_email("user@domain..com")); // Consecutive dots
+
+        // Invalid emails - local part too long
+        let long_local = "a".repeat(65);
+        assert!(!is_valid_email(&format!("{}@example.com", long_local)));
+    }
+
+    #[test]
+    fn test_generate_album_toml_with_artist_and_album() {
+        let dir = TempDir::new().unwrap();
+        generate_album_toml(
+            dir.path(),
+            &[],
+            Some("Test Artist"),
+            Some("Test Album"),
+            None,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
+
+        // Should have escaped values
+        assert!(content.contains(r#"title = "Test Album""#));
+        assert!(content.contains(r#"artist = "Test Artist""#));
+
+        // Should NOT have TODO comments for provided values
+        assert!(!content.contains("TODO: Set album title"));
+        assert!(!content.contains("TODO: Set artist name"));
+
+        // Should still have TODO for email
+        assert!(content.contains("TODO: Set email"));
+    }
+
+    #[test]
+    fn test_generate_album_toml_with_special_characters() {
+        let dir = TempDir::new().unwrap();
+        generate_album_toml(
+            dir.path(),
+            &[],
+            Some(r#"Artist "The Quote""#),
+            Some(r"Album\Backslash"),
+            Some("test@example.com"),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
+
+        // Should have escaped quotes
+        assert!(content.contains(r#"Artist \"The Quote\""#));
+
+        // Should have escaped backslash
+        assert!(content.contains(r"Album\\Backslash"));
+
+        // Should have valid email
+        assert!(content.contains(r#"rss_author_email = "test@example.com""#));
+    }
+
+    #[test]
+    fn test_generate_album_toml_invalid_email() {
+        let dir = TempDir::new().unwrap();
+        let result = generate_album_toml(
+            dir.path(),
+            &[],
+            Some("Artist"),
+            Some("Album"),
+            Some("invalid-email"),
+        );
+
+        // Should fail with invalid email
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid email"));
+    }
+
+    #[test]
+    fn test_toml_validation_with_special_chars() {
+        // Ensure TOML validation catches escaping errors
+        let dir = TempDir::new().unwrap();
+
+        // This should succeed - special chars are properly escaped
+        let result = generate_album_toml(
+            dir.path(),
+            &[],
+            Some(r#"Artist "Name""#),
+            Some(r"Album\Title"),
+            Some("test@example.com"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should successfully generate TOML with special characters"
+        );
+
+        // Verify the file can be parsed
+        let toml_content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&toml_content);
+        assert!(parsed.is_ok(), "Generated TOML should be parseable");
+    }
+
+    #[test]
+    fn test_generate_album_toml_with_tracks_validates() {
+        // Test that generated TOML with tracks is valid
+        let dir = TempDir::new().unwrap();
+        let tracks = vec![DetectedTrack {
+            path: PathBuf::from("audio/01-test.flac"),
+            title: r#"Track "With" Quotes"#.to_string(),
+            duration: Some("3:45".to_string()),
+            format: "flac".to_string(),
+        }];
+
+        generate_album_toml(dir.path(), &tracks, Some("Artist"), Some("Album"), None).unwrap();
+
+        // Verify TOML can be parsed
+        let toml_content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&toml_content);
+        assert!(
+            parsed.is_ok(),
+            "Generated TOML with tracks should be parseable"
+        );
     }
 }

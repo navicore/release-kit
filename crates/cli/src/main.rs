@@ -19,6 +19,18 @@ enum Command {
     Init {
         /// Path to create album directory
         path: PathBuf,
+
+        /// Artist name (pre-populates artist field)
+        #[arg(short, long)]
+        artist: Option<String>,
+
+        /// Album title (pre-populates album title)
+        #[arg(short = 't', long)]
+        album: Option<String>,
+
+        /// Artist email for RSS feed
+        #[arg(short, long)]
+        email: Option<String>,
     },
 
     /// Validate album configuration
@@ -111,7 +123,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { path } => commands::init::run(path).await,
+        Command::Init {
+            path,
+            artist,
+            album,
+            email,
+        } => commands::init::run(path, artist, album, email).await,
         Command::Validate { path } => commands::validate::run(path).await,
         Command::Preview { path, port } => commands::preview::run(path, port).await,
         Command::Build { path, output } => commands::build::run(path, output).await,
