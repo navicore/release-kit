@@ -64,12 +64,29 @@ fn load_config() -> Result<Option<GlobalConfig>> {
     Ok(Some(config))
 }
 
-/// Save global config
+/// Save global config with secure permissions
 fn save_config(config: &GlobalConfig) -> Result<()> {
     let path = config_path()?;
     let contents = toml::to_string_pretty(config).context("Failed to serialize config")?;
     fs::write(&path, contents).context("Failed to write config file")?;
-    println!("✅ Configuration saved to: {}", path.display());
+
+    // Set secure file permissions (0600 - owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&path, permissions)
+            .context("Failed to set secure file permissions")?;
+        println!("✅ Configuration saved to: {} (permissions: 0600)", path.display());
+    }
+
+    #[cfg(not(unix))]
+    {
+        println!("✅ Configuration saved to: {}", path.display());
+        println!("⚠️  Warning: File permissions not set (non-Unix platform)");
+        println!("   Please ensure the config file is only readable by your user");
+    }
+
     Ok(())
 }
 
@@ -504,62 +521,6 @@ impl CloudflareClient {
 
         Ok(())
     }
-
-    /// Upload file to R2 bucket using S3-compatible API
-    async fn upload_to_r2(
-        &self,
-        bucket_name: &str,
-        file_path: &Path,
-        object_key: &str,
-        r2_access_key_id: &str,
-        r2_secret_access_key: &str,
-    ) -> Result<()> {
-        // Create S3 client configured for R2
-        let credentials = AwsCredentials::new(
-            r2_access_key_id,
-            r2_secret_access_key,
-            None,
-            None,
-            "r2-credentials",
-        );
-
-        // R2 endpoint format: https://{account_id}.r2.cloudflarestorage.com
-        let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", self.account_id);
-
-        let s3_config = S3ConfigBuilder::new()
-            .region(Region::new("auto"))
-            .endpoint_url(&endpoint_url)
-            .credentials_provider(credentials)
-            .build();
-
-        let s3_client = S3Client::from_conf(s3_config);
-
-        // Read file and upload
-        let body = ByteStream::from_path(file_path)
-            .await
-            .context("Failed to read file for upload")?;
-
-        // Determine content type from file extension
-        let content_type = match file_path.extension().and_then(|e| e.to_str()) {
-            Some("flac") => "audio/flac",
-            Some("mp3") => "audio/mpeg",
-            Some("wav") => "audio/wav",
-            Some("ogg") => "audio/ogg",
-            _ => "application/octet-stream",
-        };
-
-        s3_client
-            .put_object()
-            .bucket(bucket_name)
-            .key(object_key)
-            .body(body)
-            .content_type(content_type)
-            .send()
-            .await
-            .context("Failed to upload to R2")?;
-
-        Ok(())
-    }
 }
 
 // ============================================================================
@@ -612,6 +573,89 @@ fn read_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// Validate Cloudflare API token format
+fn validate_api_token(token: &str) -> Result<()> {
+    if token.is_empty() {
+        anyhow::bail!("API token cannot be empty");
+    }
+    if token.len() < 20 {
+        anyhow::bail!("API token appears too short (expected 40+ characters)");
+    }
+    if !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        anyhow::bail!("API token contains invalid characters");
+    }
+    Ok(())
+}
+
+/// Validate Cloudflare account ID format
+fn validate_account_id(account_id: &str) -> Result<()> {
+    if account_id.is_empty() {
+        anyhow::bail!("Account ID cannot be empty");
+    }
+    // Account IDs are 32-character hex strings
+    if account_id.len() != 32 {
+        anyhow::bail!("Account ID must be exactly 32 characters");
+    }
+    if !account_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("Account ID must be hexadecimal (0-9, a-f)");
+    }
+    Ok(())
+}
+
+/// Validate domain format
+fn validate_domain(domain: &str) -> Result<()> {
+    if domain.is_empty() {
+        anyhow::bail!("Domain cannot be empty");
+    }
+
+    // Basic domain validation
+    if !domain.contains('.') {
+        anyhow::bail!("Domain must contain at least one dot (e.g., example.com)");
+    }
+
+    if domain.starts_with('.') || domain.ends_with('.') {
+        anyhow::bail!("Domain cannot start or end with a dot");
+    }
+
+    if domain.starts_with('-') || domain.ends_with('-') {
+        anyhow::bail!("Domain cannot start or end with a hyphen");
+    }
+
+    // Check for invalid characters
+    if !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        anyhow::bail!("Domain contains invalid characters (only a-z, 0-9, '.', '-' allowed)");
+    }
+
+    // Domain labels (parts between dots) validation
+    for label in domain.split('.') {
+        if label.is_empty() {
+            anyhow::bail!("Domain cannot have consecutive dots");
+        }
+        if label.len() > 63 {
+            anyhow::bail!("Domain label '{}' is too long (max 63 characters)", label);
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            anyhow::bail!("Domain label '{}' cannot start or end with hyphen", label);
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate R2 access key format
+fn validate_r2_access_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        anyhow::bail!("R2 access key cannot be empty");
+    }
+    if key.len() < 10 {
+        anyhow::bail!("R2 access key appears too short");
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric()) {
+        anyhow::bail!("R2 access key should only contain alphanumeric characters");
+    }
+    Ok(())
+}
+
 /// Configure Cloudflare credentials and base domain
 pub async fn configure() -> Result<()> {
     println!("🔧 Configuring Cloudflare deployment...\n");
@@ -649,9 +693,9 @@ pub async fn configure() -> Result<()> {
         read_input("API Token: ")?
     };
 
-    if api_token.is_empty() {
-        anyhow::bail!("API token is required");
-    }
+    // Validate API token
+    validate_api_token(&api_token)
+        .context("Invalid API token format - please check your token")?;
 
     // Get account ID
     let default_account = existing
@@ -669,9 +713,9 @@ pub async fn configure() -> Result<()> {
         read_input("Account ID: ")?
     };
 
-    if account_id.is_empty() {
-        anyhow::bail!("Account ID is required");
-    }
+    // Validate account ID
+    validate_account_id(&account_id)
+        .context("Invalid account ID format - should be 32-character hexadecimal")?;
 
     // Get R2 Access Key ID
     let default_r2_key = existing
@@ -687,11 +731,19 @@ pub async fn configure() -> Result<()> {
         if input.is_empty() {
             Some(default_r2_key.to_string())
         } else {
+            validate_r2_access_key(&input)
+                .context("Invalid R2 access key format")?;
             Some(input)
         }
     } else {
         let input = read_input("R2 Access Key ID (optional, press Enter to skip): ")?;
-        if input.is_empty() { None } else { Some(input) }
+        if input.is_empty() {
+            None
+        } else {
+            validate_r2_access_key(&input)
+                .context("Invalid R2 access key format")?;
+            Some(input)
+        }
     };
 
     // Get R2 Secret Access Key (only if Access Key ID was provided)
@@ -740,11 +792,19 @@ pub async fn configure() -> Result<()> {
         } else if input.eq_ignore_ascii_case("none") {
             None
         } else {
+            validate_domain(&input)
+                .context("Invalid domain format")?;
             Some(input)
         }
     } else {
         let input = read_input("Base Domain (optional, press Enter to skip): ")?;
-        if input.is_empty() { None } else { Some(input) }
+        if input.is_empty() {
+            None
+        } else {
+            validate_domain(&input)
+                .context("Invalid domain format")?;
+            Some(input)
+        }
     };
 
     // Create config
@@ -889,14 +949,16 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
             }
         };
 
-        // Upload audio files to R2
-        println!("   📤 Uploading audio files to R2...");
+        // Upload audio files to R2 in parallel
+        println!("   📤 Uploading audio files to R2 (parallel)...");
         let audio_dir = path.join("audio");
         if !audio_dir.exists() {
             anyhow::bail!("Audio directory not found: {}", audio_dir.display());
         }
 
-        let mut upload_count = 0;
+        // Collect upload tasks
+        let mut upload_tasks = Vec::new();
+
         for track in &album.tracks {
             let audio_file = path.join(&track.file);
             if !audio_file.exists() {
@@ -911,37 +973,131 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
                 .file_name()
                 .context("Invalid audio filename")?
                 .to_str()
-                .context("Invalid UTF-8 in filename")?;
+                .context("Invalid UTF-8 in filename")?
+                .to_string();
 
             let r2_key = format!("audio/{}", filename);
 
-            client
-                .upload_to_r2(
-                    &bucket_name,
-                    &audio_file,
-                    &r2_key,
-                    config
-                        .cloudflare
-                        .r2_access_key_id
-                        .as_ref()
-                        .context("R2 access key missing")?,
-                    config
-                        .cloudflare
-                        .r2_secret_access_key
-                        .as_ref()
-                        .context("R2 secret key missing")?,
-                )
-                .await?;
+            // Clone data needed for async task
+            let bucket_name_clone = bucket_name.clone();
+            let audio_file_clone = audio_file.clone();
+            let r2_access_key = config
+                .cloudflare
+                .r2_access_key_id
+                .clone()
+                .context("R2 access key missing")?;
+            let r2_secret_key = config
+                .cloudflare
+                .r2_secret_access_key
+                .clone()
+                .context("R2 secret key missing")?;
+            let account_id = config.cloudflare.account_id.clone();
 
-            upload_count += 1;
+            // Spawn upload task
+            let task = tokio::spawn(async move {
+                // Create S3 client for this upload
+                let credentials = AwsCredentials::new(
+                    &r2_access_key,
+                    &r2_secret_key,
+                    None,
+                    None,
+                    "r2-credentials",
+                );
+
+                let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
+
+                let s3_config = S3ConfigBuilder::new()
+                    .region(Region::new("auto"))
+                    .endpoint_url(&endpoint_url)
+                    .credentials_provider(credentials)
+                    .build();
+
+                let s3_client = S3Client::from_conf(s3_config);
+
+                // Upload file
+                let body = ByteStream::from_path(&audio_file_clone)
+                    .await
+                    .context("Failed to read file for upload")?;
+
+                let content_type = match audio_file_clone.extension().and_then(|e| e.to_str()) {
+                    Some("flac") => "audio/flac",
+                    Some("mp3") => "audio/mpeg",
+                    Some("wav") => "audio/wav",
+                    Some("ogg") => "audio/ogg",
+                    _ => "application/octet-stream",
+                };
+
+                s3_client
+                    .put_object()
+                    .bucket(&bucket_name_clone)
+                    .key(&r2_key)
+                    .body(body)
+                    .content_type(content_type)
+                    .send()
+                    .await
+                    .context("Failed to upload to R2")?;
+
+                Ok::<String, anyhow::Error>(filename)
+            });
+
+            upload_tasks.push(task);
         }
-        println!("   ✓ Uploaded {} audio files", upload_count);
+
+        // Wait for all uploads to complete
+        let mut successful_uploads = 0;
+        let mut failed_uploads = Vec::new();
+
+        for task in upload_tasks {
+            match task.await {
+                Ok(Ok(filename)) => {
+                    successful_uploads += 1;
+                    println!("      ✓ {}", filename);
+                }
+                Ok(Err(e)) => {
+                    failed_uploads.push(format!("{}", e));
+                }
+                Err(e) => {
+                    failed_uploads.push(format!("Task error: {}", e));
+                }
+            }
+        }
+
+        if !failed_uploads.is_empty() {
+            eprintln!("   ⚠️  Some uploads failed:");
+            for error in &failed_uploads {
+                eprintln!("      - {}", error);
+            }
+            anyhow::bail!("{} upload(s) failed", failed_uploads.len());
+        }
+
+        println!("   ✓ Uploaded {} audio files", successful_uploads);
 
         // Configure CORS if bucket was just created
         if !bucket_exists {
             println!("   🔧 Configuring R2 public access...");
             client.configure_r2_public_access(&bucket_name).await?;
             println!("   ✓ Public access configured");
+        }
+
+        // Verify bucket is accessible with R2 credentials
+        println!("   🔍 Verifying R2 bucket accessibility...");
+        match client.get_r2_bucket(&bucket_name).await {
+            Ok(Some(_)) => {
+                println!("   ✓ R2 bucket verified accessible");
+            }
+            Ok(None) => {
+                anyhow::bail!(
+                    "R2 bucket '{}' not found after creation - this shouldn't happen",
+                    bucket_name
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Failed to verify R2 bucket accessibility: {}\n\
+                     Please check your R2 credentials and permissions.",
+                    e
+                );
+            }
         }
 
         // Set up custom domain for R2 if base domain is configured
