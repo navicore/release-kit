@@ -43,13 +43,57 @@ fn toml_escape_string(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
-/// Validate email format (basic check)
+/// Validate email format
+/// Checks for basic RFC 5322 compliance without full regex
 fn is_valid_email(email: &str) -> bool {
-    email.contains('@')
-        && email.contains('.')
-        && !email.starts_with('@')
-        && !email.ends_with('@')
-        && email.len() >= 5
+    // Must have exactly one @ symbol
+    let at_count = email.matches('@').count();
+    if at_count != 1 {
+        return false;
+    }
+
+    let parts: Vec<&str> = email.split('@').collect();
+    let local = parts[0];
+    let domain = parts[1];
+
+    // Local part (before @) checks
+    if local.is_empty() || local.len() > 64 {
+        return false;
+    }
+
+    // Domain checks
+    if domain.is_empty() || domain.len() > 255 {
+        return false;
+    }
+
+    // Domain must have at least one dot
+    if !domain.contains('.') {
+        return false;
+    }
+
+    // Domain can't start/end with dot or hyphen
+    if domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.starts_with('-')
+        || domain.ends_with('-')
+    {
+        return false;
+    }
+
+    // No consecutive dots
+    if domain.contains("..") {
+        return false;
+    }
+
+    // Domain must have valid TLD (at least 2 chars after last dot)
+    if let Some(last_dot) = domain.rfind('.') {
+        let tld = &domain[last_dot + 1..];
+        if tld.len() < 2 {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[derive(Debug)]
@@ -1000,15 +1044,30 @@ mod tests {
         // Valid emails
         assert!(is_valid_email("user@example.com"));
         assert!(is_valid_email("test.user@domain.co.uk"));
-        assert!(is_valid_email("a@b.c"));
+        assert!(is_valid_email("name+tag@example.org"));
 
-        // Invalid emails
+        // Invalid emails - missing @
+        assert!(!is_valid_email("user"));
+        assert!(!is_valid_email(""));
+
+        // Invalid emails - multiple @
+        assert!(!is_valid_email("user@@example.com"));
+        assert!(!is_valid_email("user@name@example.com"));
+
+        // Invalid emails - missing parts
         assert!(!is_valid_email("@example.com"));
         assert!(!is_valid_email("user@"));
-        assert!(!is_valid_email("user"));
-        assert!(!is_valid_email("user@domain"));
-        assert!(!is_valid_email("a@b"));
-        assert!(!is_valid_email(""));
+
+        // Invalid emails - invalid domain
+        assert!(!is_valid_email("user@domain")); // No TLD
+        assert!(!is_valid_email("user@.com")); // Domain starts with dot
+        assert!(!is_valid_email("user@domain.")); // Domain ends with dot
+        assert!(!is_valid_email("user@domain.c")); // TLD too short
+        assert!(!is_valid_email("user@domain..com")); // Consecutive dots
+
+        // Invalid emails - local part too long
+        let long_local = "a".repeat(65);
+        assert!(!is_valid_email(&format!("{}@example.com", long_local)));
     }
 
     #[test]
@@ -1075,5 +1134,52 @@ mod tests {
         // Should fail with invalid email
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid email"));
+    }
+
+    #[test]
+    fn test_toml_validation_with_special_chars() {
+        // Ensure TOML validation catches escaping errors
+        let dir = TempDir::new().unwrap();
+
+        // This should succeed - special chars are properly escaped
+        let result = generate_album_toml(
+            dir.path(),
+            &[],
+            Some(r#"Artist "Name""#),
+            Some(r"Album\Title"),
+            Some("test@example.com"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should successfully generate TOML with special characters"
+        );
+
+        // Verify the file can be parsed
+        let toml_content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&toml_content);
+        assert!(parsed.is_ok(), "Generated TOML should be parseable");
+    }
+
+    #[test]
+    fn test_generate_album_toml_with_tracks_validates() {
+        // Test that generated TOML with tracks is valid
+        let dir = TempDir::new().unwrap();
+        let tracks = vec![DetectedTrack {
+            path: PathBuf::from("audio/01-test.flac"),
+            title: r#"Track "With" Quotes"#.to_string(),
+            duration: Some("3:45".to_string()),
+            format: "flac".to_string(),
+        }];
+
+        generate_album_toml(dir.path(), &tracks, Some("Artist"), Some("Album"), None).unwrap();
+
+        // Verify TOML can be parsed
+        let toml_content = fs::read_to_string(dir.path().join("album.toml")).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&toml_content);
+        assert!(
+            parsed.is_ok(),
+            "Generated TOML with tracks should be parseable"
+        );
     }
 }
