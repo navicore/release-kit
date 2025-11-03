@@ -2955,6 +2955,7 @@ dependencies = [
  "rust-s3",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml 0.9.8",

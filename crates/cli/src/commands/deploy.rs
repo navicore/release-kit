@@ -282,12 +282,13 @@ impl CloudflareClient {
                 .to_string_lossy()
                 .replace('\\', "/"); // Normalize path separators
 
-            // Read file and calculate hash
+            // Read file and calculate SHA256 hash
             let file_bytes = std::fs::read(path)
                 .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
-            // Use a simple hash for the manifest (Cloudflare may not strictly validate this)
-            let hash = format!("{:x}", file_bytes.len()); // Simple approach: use file size as hash
+            // Calculate SHA256 hash for manifest
+            use sha2::{Digest, Sha256};
+            let hash = format!("{:x}", Sha256::digest(&file_bytes));
 
             manifest.insert(relative_path.clone(), hash);
 
@@ -323,15 +324,21 @@ impl CloudflareClient {
             anyhow::bail!("Upload failed ({}): {}", status, response_text);
         }
 
-        // Parse response to get deployment URL
-        let cf_response: serde_json::Value = serde_json::from_str(&response_text)?;
+        // Parse and validate response
+        let cf_response: CloudflareResponse<serde_json::Value> =
+            serde_json::from_str(&response_text).context("Failed to parse deployment response")?;
+
+        if !cf_response.success {
+            if let Some(error) = cf_response.errors.first() {
+                anyhow::bail!("Deployment failed: {}", error.message);
+            }
+            anyhow::bail!("Deployment failed with unknown error");
+        }
 
         let deployment_url = cf_response
-            .get("result")
-            .and_then(|r| r.get("url"))
-            .and_then(|u| u.as_str())
-            .unwrap_or(&format!("https://{}.pages.dev", project_name))
-            .to_string();
+            .result
+            .and_then(|r| r.get("url").and_then(|u| u.as_str().map(String::from)))
+            .unwrap_or_else(|| format!("https://{}.pages.dev", project_name));
 
         Ok(deployment_url)
     }
@@ -371,6 +378,23 @@ impl CloudflareClient {
         }
 
         Ok(cf_response.result.and_then(|mut zones| zones.pop()))
+    }
+
+    /// Get existing DNS record by name
+    async fn get_dns_record(&self, zone_id: &str, name: &str) -> Result<Option<DnsRecord>> {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{}/dns_records?name={}",
+            zone_id, name
+        );
+
+        let response = self.client.get(&url).send().await?;
+        let cf_response: CloudflareResponse<Vec<DnsRecord>> = response.json().await?;
+
+        if !cf_response.success {
+            return Ok(None);
+        }
+
+        Ok(cf_response.result.and_then(|mut records| records.pop()))
     }
 
     /// Create DNS CNAME record
@@ -1092,8 +1116,11 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
 
         // Spawn upload task with retry logic and concurrency limiting
         let task = tokio::spawn(async move {
-            // Acquire semaphore permit (limits to 3 concurrent uploads)
-            let _permit = semaphore_clone.acquire().await.unwrap();
+            // Acquire semaphore permit (limits concurrent uploads)
+            let _permit = semaphore_clone
+                .acquire()
+                .await
+                .expect("Semaphore should not be closed");
 
             let content_type = match audio_file_clone.extension().and_then(|e| e.to_str()) {
                 Some("flac") => "audio/flac",
@@ -1221,16 +1248,25 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
                 if let Some(zone) = client.get_dns_zone(base_domain).await? {
                     let r2_target =
                         format!("{}.r2.cloudflarestorage.com", config.cloudflare.account_id);
-                    match client
-                        .create_dns_record(&zone.id, &cdn_domain, &r2_target)
-                        .await
-                    {
-                        Ok(_) => {
-                            println!("   ✓ DNS record created: {} → {}", cdn_domain, r2_target);
-                        }
-                        Err(e) => {
-                            println!("   ⚠️  DNS record creation failed: {}", e);
-                            println!("   💡 You may need to create it manually");
+
+                    // Check if DNS record already exists
+                    if let Some(existing) = client.get_dns_record(&zone.id, &cdn_domain).await? {
+                        println!(
+                            "   ✓ DNS record already exists: {} → {}",
+                            cdn_domain, existing.content
+                        );
+                    } else {
+                        match client
+                            .create_dns_record(&zone.id, &cdn_domain, &r2_target)
+                            .await
+                        {
+                            Ok(_) => {
+                                println!("   ✓ DNS record created: {} → {}", cdn_domain, r2_target);
+                            }
+                            Err(e) => {
+                                println!("   ⚠️  DNS record creation failed: {}", e);
+                                println!("   💡 You may need to create it manually");
+                            }
                         }
                     }
                 }
@@ -1286,20 +1322,27 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
             Some(zone) => {
                 println!("   ✓ Found DNS zone for {}", base_domain);
 
-                // Create CNAME record
+                // Check if CNAME record already exists
                 let target = format!("{}.pages.dev", project_name);
-                match client
-                    .create_dns_record(&zone.id, &full_domain, &target)
-                    .await
-                {
-                    Ok(_) => {
-                        println!("   ✓ Created DNS record: {} → {}", full_domain, target);
-                    }
-                    Err(e) => {
-                        println!("   ⚠️  DNS record creation failed: {}", e);
-                        println!(
-                            "   💡 You may need to create it manually in Cloudflare dashboard"
-                        );
+                if let Some(existing) = client.get_dns_record(&zone.id, &full_domain).await? {
+                    println!(
+                        "   ✓ DNS record already exists: {} → {}",
+                        full_domain, existing.content
+                    );
+                } else {
+                    match client
+                        .create_dns_record(&zone.id, &full_domain, &target)
+                        .await
+                    {
+                        Ok(_) => {
+                            println!("   ✓ Created DNS record: {} → {}", full_domain, target);
+                        }
+                        Err(e) => {
+                            println!("   ⚠️  DNS record creation failed: {}", e);
+                            println!(
+                                "   💡 You may need to create it manually in Cloudflare dashboard"
+                            );
+                        }
                     }
                 }
             }
