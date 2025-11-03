@@ -1,20 +1,15 @@
 use anyhow::{Context, Result};
-use aws_config::Region;
-use aws_credential_types::Credentials as AwsCredentials;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Builder as S3ConfigBuilder;
-use aws_sdk_s3::primitives::ByteStream;
 use release_kit_core::config::parse_album_toml;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use s3::Bucket as S3Bucket;
+use s3::Region as S3Region;
+use s3::creds::Credentials as S3Credentials;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
-use walkdir::WalkDir;
-use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
 
 use super::build::build_static_site;
 
@@ -35,12 +30,10 @@ pub struct CloudflareConfig {
     pub account_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_domain: Option<String>,
-    /// R2 Access Key ID (S3-compatible credentials)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r2_access_key_id: Option<String>,
-    /// R2 Secret Access Key (S3-compatible credentials)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub r2_secret_access_key: Option<String>,
+    /// R2 Access Key ID (S3-compatible credentials) - REQUIRED
+    pub r2_access_key_id: String,
+    /// R2 Secret Access Key (S3-compatible credentials) - REQUIRED
+    pub r2_secret_access_key: String,
 }
 
 /// Get path to global config file
@@ -141,7 +134,8 @@ struct CloudflareResponse<T> {
 
 #[derive(Debug, Deserialize)]
 struct CloudflareError {
-    _code: i32,
+    #[allow(dead_code)]
+    code: i32,
     message: String,
 }
 
@@ -162,7 +156,8 @@ struct PagesProject {
 #[derive(Debug, Deserialize)]
 struct DnsZone {
     id: String,
-    _name: String,
+    #[allow(dead_code)]
+    name: String,
 }
 
 /// DNS Record
@@ -189,6 +184,9 @@ struct R2Bucket {
 #[derive(Debug, Deserialize, Serialize)]
 struct R2CustomDomain {
     domain: String,
+    enabled: bool,
+    #[serde(rename = "zoneId")]
+    zone_id: String,
 }
 
 impl CloudflareClient {
@@ -269,24 +267,56 @@ impl CloudflareClient {
 
     /// Upload static site files to Pages project (Direct Upload)
     async fn upload_deployment(&self, project_name: &str, build_dir: &Path) -> Result<String> {
-        // Create zip file of build directory
-        let zip_path = create_deployment_zip(build_dir)?;
+        use std::collections::HashMap;
+        use walkdir::WalkDir;
+
+        // Build manifest of all files with their hashes
+        let mut manifest = HashMap::new();
+        let mut form = reqwest::multipart::Form::new();
+
+        for entry in WalkDir::new(build_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+            let relative_path = path
+                .strip_prefix(build_dir)
+                .context("Failed to get relative path")?
+                .to_string_lossy()
+                .replace('\\', "/"); // Normalize path separators
+
+            // Read file and calculate SHA256 hash
+            let file_bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read file: {}", path.display()))?;
+
+            // Calculate SHA256 hash for manifest
+            use sha2::{Digest, Sha256};
+            let hash = format!("{:x}", Sha256::digest(&file_bytes));
+
+            manifest.insert(relative_path.clone(), hash);
+
+            // Add file to multipart form
+            let mime_type = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string();
+
+            form = form.part(
+                relative_path.clone(),
+                reqwest::multipart::Part::bytes(file_bytes)
+                    .file_name(relative_path.clone())
+                    .mime_str(&mime_type)?,
+            );
+        }
+
+        // Add manifest as JSON field
+        let manifest_json = serde_json::to_string(&manifest)?;
+        form = form.text("manifest", manifest_json);
 
         // Upload via Cloudflare Pages Direct Upload API
         let url = format!(
             "https://api.cloudflare.com/client/v4/accounts/{}/pages/projects/{}/deployments",
             self.account_id, project_name
-        );
-
-        // Read the zip file
-        let zip_bytes = std::fs::read(&zip_path).context("Failed to read deployment zip")?;
-
-        // Create multipart form
-        let form = reqwest::multipart::Form::new().part(
-            "file",
-            reqwest::multipart::Part::bytes(zip_bytes)
-                .file_name("deployment.zip")
-                .mime_str("application/zip")?,
         );
 
         let response = self.client.post(&url).multipart(form).send().await?;
@@ -298,15 +328,21 @@ impl CloudflareClient {
             anyhow::bail!("Upload failed ({}): {}", status, response_text);
         }
 
-        // Parse response to get deployment URL
-        let cf_response: serde_json::Value = serde_json::from_str(&response_text)?;
+        // Parse and validate response
+        let cf_response: CloudflareResponse<serde_json::Value> =
+            serde_json::from_str(&response_text).context("Failed to parse deployment response")?;
+
+        if !cf_response.success {
+            if let Some(error) = cf_response.errors.first() {
+                anyhow::bail!("Deployment failed: {}", error.message);
+            }
+            anyhow::bail!("Deployment failed with unknown error");
+        }
 
         let deployment_url = cf_response
-            .get("result")
-            .and_then(|r| r.get("url"))
-            .and_then(|u| u.as_str())
-            .unwrap_or(&format!("https://{}.pages.dev", project_name))
-            .to_string();
+            .result
+            .and_then(|r| r.get("url").and_then(|u| u.as_str().map(String::from)))
+            .unwrap_or_else(|| format!("https://{}.pages.dev", project_name));
 
         Ok(deployment_url)
     }
@@ -346,6 +382,23 @@ impl CloudflareClient {
         }
 
         Ok(cf_response.result.and_then(|mut zones| zones.pop()))
+    }
+
+    /// Get existing DNS record by name
+    async fn get_dns_record(&self, zone_id: &str, name: &str) -> Result<Option<DnsRecord>> {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{}/dns_records?name={}",
+            zone_id, name
+        );
+
+        let response = self.client.get(&url).send().await?;
+        let cf_response: CloudflareResponse<Vec<DnsRecord>> = response.json().await?;
+
+        if !cf_response.success {
+            return Ok(None);
+        }
+
+        Ok(cf_response.result.and_then(|mut records| records.pop()))
     }
 
     /// Create DNS CNAME record
@@ -437,6 +490,123 @@ impl CloudflareClient {
         cf_response.result.context("No bucket returned from API")
     }
 
+    /// Empty R2 bucket by deleting all objects
+    async fn empty_r2_bucket(
+        &self,
+        bucket_name: &str,
+        r2_access_key_id: &str,
+        r2_secret_access_key: &str,
+    ) -> Result<()> {
+        // Create rust-s3 bucket for R2
+        let credentials = S3Credentials::new(
+            Some(r2_access_key_id),
+            Some(r2_secret_access_key),
+            None,
+            None,
+            None,
+        )?;
+
+        let region = S3Region::R2 {
+            account_id: self.account_id.clone(),
+        };
+
+        let bucket = S3Bucket::new(bucket_name, region, credentials)?.with_path_style();
+
+        // List all objects in the bucket
+        println!("      Listing bucket: {}", bucket_name);
+        println!(
+            "      Endpoint: https://{}.r2.cloudflarestorage.com",
+            self.account_id
+        );
+
+        // List all completed objects
+        println!("      Listing completed objects...");
+        let list_results = bucket.list("".to_string(), None).await?;
+
+        let mut all_keys = Vec::new();
+
+        // Collect all object keys
+        for (idx, list) in list_results.iter().enumerate() {
+            println!(
+                "      Page {}: {} objects, {} common prefixes, truncated: {}",
+                idx,
+                list.contents.len(),
+                list.common_prefixes.as_ref().map(|p| p.len()).unwrap_or(0),
+                list.is_truncated
+            );
+
+            for obj in &list.contents {
+                all_keys.push(obj.key.clone());
+            }
+
+            // Also check common prefixes (directories)
+            if let Some(prefixes) = &list.common_prefixes {
+                for prefix in prefixes {
+                    println!("      Found prefix: {}", prefix.prefix);
+                    // List objects under this prefix
+                    let prefix_results = bucket.list(prefix.prefix.clone(), None).await?;
+                    for prefix_list in prefix_results {
+                        for obj in &prefix_list.contents {
+                            all_keys.push(obj.key.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_objects = all_keys.len();
+        let mut deleted_objects = 0;
+
+        // Delete all objects
+        for key in all_keys {
+            println!("      Deleting: {}", key);
+            bucket
+                .delete_object(&key)
+                .await
+                .with_context(|| format!("Failed to delete object: {}", key))?;
+            deleted_objects += 1;
+        }
+
+        if total_objects > 0 {
+            println!("      ✓ Deleted {} objects", deleted_objects);
+        } else {
+            println!("      ⚠️  No completed objects found");
+        }
+
+        // List and abort incomplete multipart uploads
+        println!("      Checking for incomplete multipart uploads...");
+        let multipart_results = bucket.list_multiparts_uploads(None, None).await?;
+
+        let mut total_uploads = 0;
+        let mut aborted_uploads = 0;
+
+        for upload_list in multipart_results {
+            total_uploads += upload_list.uploads.len();
+            for upload in &upload_list.uploads {
+                println!(
+                    "      Aborting multipart upload: {} ({})",
+                    upload.key, upload.id
+                );
+                match bucket.abort_upload(&upload.key, &upload.id).await {
+                    Ok(_) => {
+                        aborted_uploads += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("      ⚠️  Failed to abort upload {}: {}", upload.key, e);
+                    }
+                }
+            }
+        }
+
+        if total_uploads > 0 {
+            println!("      ✓ Aborted {} multipart uploads", aborted_uploads);
+        } else {
+            println!("      ✓ No incomplete uploads found");
+        }
+
+        Ok(())
+    }
+
     /// Delete R2 bucket
     async fn delete_r2_bucket(&self, bucket_name: &str) -> Result<()> {
         let url = format!(
@@ -466,23 +636,31 @@ impl CloudflareClient {
         );
 
         #[derive(Serialize)]
+        struct CorsAllowed {
+            methods: Vec<String>,
+            origins: Vec<String>,
+            headers: Vec<String>,
+        }
+
+        #[derive(Serialize)]
         struct CorsRule {
-            allowed_origins: Vec<String>,
-            allowed_methods: Vec<String>,
-            allowed_headers: Vec<String>,
+            allowed: CorsAllowed,
+            #[serde(rename = "MaxAgeSeconds")]
             max_age_seconds: u32,
         }
 
         #[derive(Serialize)]
         struct CorsConfig {
-            cors_rules: Vec<CorsRule>,
+            rules: Vec<CorsRule>,
         }
 
         let config = CorsConfig {
-            cors_rules: vec![CorsRule {
-                allowed_origins: vec!["*".to_string()],
-                allowed_methods: vec!["GET".to_string(), "HEAD".to_string()],
-                allowed_headers: vec!["*".to_string()],
+            rules: vec![CorsRule {
+                allowed: CorsAllowed {
+                    methods: vec!["GET".to_string(), "HEAD".to_string()],
+                    origins: vec!["*".to_string()],
+                    headers: vec!["content-type".to_string()],
+                },
                 max_age_seconds: 3600,
             }],
         };
@@ -501,18 +679,25 @@ impl CloudflareClient {
     }
 
     /// Add custom domain to R2 bucket
-    async fn add_r2_custom_domain(&self, bucket_name: &str, domain: &str) -> Result<()> {
+    async fn add_r2_custom_domain(
+        &self,
+        bucket_name: &str,
+        domain: &str,
+        zone_id: &str,
+    ) -> Result<()> {
         let url = format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/r2/buckets/{}/domains",
+            "https://api.cloudflare.com/client/v4/accounts/{}/r2/buckets/{}/domains/custom",
             self.account_id, bucket_name
         );
 
         let request = R2CustomDomain {
             domain: domain.to_string(),
+            enabled: true,
+            zone_id: zone_id.to_string(),
         };
 
         let response = self.client.post(&url).json(&request).send().await?;
-        let cf_response: CloudflareResponse<R2CustomDomain> = response.json().await?;
+        let cf_response: CloudflareResponse<serde_json::Value> = response.json().await?;
 
         if !cf_response.success {
             if let Some(error) = cf_response.errors.first() {
@@ -527,41 +712,6 @@ impl CloudflareClient {
 
 // ============================================================================
 // Helper Functions
-// ============================================================================
-
-/// Create a zip file of the build directory for deployment
-fn create_deployment_zip(build_dir: &Path) -> Result<PathBuf> {
-    let zip_path =
-        std::env::temp_dir().join(format!("release-kit-deploy-{}.zip", std::process::id()));
-
-    let file = File::create(&zip_path).context("Failed to create deployment zip file")?;
-    let mut zip = ZipWriter::new(file);
-
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-    // Walk the build directory and add all files
-    for entry in WalkDir::new(build_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        let relative_path = path
-            .strip_prefix(build_dir)
-            .context("Failed to get relative path")?;
-
-        // Add file to zip
-        zip.start_file(relative_path.to_string_lossy().to_string(), options)?;
-
-        let mut f = File::open(path)?;
-        std::io::copy(&mut f, &mut zip)?;
-    }
-
-    zip.finish()?;
-
-    Ok(zip_path)
-}
-
 // ============================================================================
 // Deploy Commands
 // ============================================================================
@@ -580,7 +730,7 @@ fn validate_api_token(token: &str) -> Result<()> {
     if token.is_empty() {
         anyhow::bail!("API token cannot be empty");
     }
-    if token.len() < 20 {
+    if token.len() < 40 {
         anyhow::bail!("API token appears too short (expected 40+ characters)");
     }
     if !token
@@ -724,11 +874,10 @@ pub async fn configure() -> Result<()> {
     validate_account_id(&account_id)
         .context("Invalid account ID format - should be 32-character hexadecimal")?;
 
-    // Get R2 Access Key ID
+    // Get R2 Access Key ID (REQUIRED)
     let default_r2_key = existing
         .as_ref()
-        .and_then(|c| c.cloudflare.r2_access_key_id.as_ref())
-        .map(|s| s.as_str())
+        .map(|c| c.cloudflare.r2_access_key_id.as_str())
         .unwrap_or("");
     let r2_access_key_id = if !default_r2_key.is_empty() {
         let input = read_input(&format!(
@@ -736,49 +885,41 @@ pub async fn configure() -> Result<()> {
             &default_r2_key[..10.min(default_r2_key.len())]
         ))?;
         if input.is_empty() {
-            Some(default_r2_key.to_string())
+            default_r2_key.to_string()
         } else {
             validate_r2_access_key(&input).context("Invalid R2 access key format")?;
-            Some(input)
+            input
         }
     } else {
-        let input = read_input("R2 Access Key ID (optional, press Enter to skip): ")?;
+        let input = read_input("R2 Access Key ID: ")?;
         if input.is_empty() {
-            None
-        } else {
-            validate_r2_access_key(&input).context("Invalid R2 access key format")?;
-            Some(input)
+            anyhow::bail!("R2 Access Key ID is required for audio storage");
         }
+        validate_r2_access_key(&input).context("Invalid R2 access key format")?;
+        input
     };
 
-    // Get R2 Secret Access Key (only if Access Key ID was provided)
-    let r2_secret_access_key = if r2_access_key_id.is_some() {
-        let default_r2_secret = existing
-            .as_ref()
-            .and_then(|c| c.cloudflare.r2_secret_access_key.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let secret = if !default_r2_secret.is_empty() {
-            let input = read_input(&format!(
-                "R2 Secret Access Key [current: {}...]: ",
-                &default_r2_secret[..10.min(default_r2_secret.len())]
-            ))?;
-            if input.is_empty() {
-                Some(default_r2_secret.to_string())
-            } else {
-                Some(input)
-            }
+    // Get R2 Secret Access Key (REQUIRED)
+    let default_r2_secret = existing
+        .as_ref()
+        .map(|c| c.cloudflare.r2_secret_access_key.as_str())
+        .unwrap_or("");
+    let r2_secret_access_key = if !default_r2_secret.is_empty() {
+        let input = read_input(&format!(
+            "R2 Secret Access Key [current: {}...]: ",
+            &default_r2_secret[..10.min(default_r2_secret.len())]
+        ))?;
+        if input.is_empty() {
+            default_r2_secret.to_string()
         } else {
-            let input = read_input("R2 Secret Access Key: ")?;
-            if input.is_empty() { None } else { Some(input) }
-        };
-
-        if secret.is_none() {
-            println!("⚠️  R2 Secret not provided - R2 storage will not be available");
+            input
         }
-        secret
     } else {
-        None
+        let input = read_input("R2 Secret Access Key: ")?;
+        if input.is_empty() {
+            anyhow::bail!("R2 Secret Access Key is required for audio storage");
+        }
+        input
     };
 
     // Get base domain (optional)
@@ -826,26 +967,16 @@ pub async fn configure() -> Result<()> {
 
     println!();
     println!("✅ Configuration complete!");
-
-    // Show R2 status
-    if config.cloudflare.r2_access_key_id.is_some()
-        && config.cloudflare.r2_secret_access_key.is_some()
-    {
-        println!("   ✓ R2 storage configured (audio files will use R2)");
-    } else {
-        println!("   ⚠️  R2 not configured (audio bundled with Pages - may hit 25MB limit)");
-        println!("   💡 Tip: Add R2 credentials with 'release-kit deploy configure'");
-    }
+    println!("   ✓ R2 storage configured (audio files will use R2)");
 
     if let Some(domain) = &config.cloudflare.base_domain {
         println!("   ✓ Base domain: {}", domain);
         println!("   Albums will deploy to subdomains: album-name.{}", domain);
-        if config.cloudflare.r2_access_key_id.is_some() {
-            println!("   Audio will be served from: cdn.{}", domain);
-        }
+        println!("   Audio will be served from: cdn.{}", domain);
     } else {
         println!("   ⚠️  No base domain configured");
         println!("   Albums will deploy to: *.pages.dev");
+        println!("   Audio will be served from: R2 public URL");
         println!("   💡 Tip: Add a base domain with 'release-kit deploy configure'");
     }
     println!();
@@ -855,7 +986,7 @@ pub async fn configure() -> Result<()> {
 }
 
 /// Publish album to Cloudflare Pages
-pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
+pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> Result<()> {
     println!("🚀 Publishing album to Cloudflare Pages...\n");
 
     // Validate and load album config
@@ -928,238 +1059,281 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
         println!();
     }
 
-    // Determine if we're using R2 for audio storage
-    let use_r2 = config.cloudflare.r2_access_key_id.is_some()
-        && config.cloudflare.r2_secret_access_key.is_some();
+    // R2 audio storage (always enabled)
+    // R2 bucket name: {project-name}-audio
+    //
+    // Memory Requirements:
+    // - Each audio file is loaded entirely into memory during upload
+    // - For large albums with high-quality audio (e.g., 10 FLAC files @ 200MB each),
+    //   peak memory usage can reach 600MB+ (3 concurrent uploads × 200MB per file)
+    // - Adjust concurrency (-c flag) if running on memory-constrained systems
+    // - Example: Use `-c 1` for single-file uploads to minimize memory usage
+    let bucket_name = format!("{}-audio", project_name);
 
-    let audio_base_url = if use_r2 {
-        // R2 bucket name: {project-name}-audio
-        let bucket_name = format!("{}-audio", project_name);
+    println!("📦 Setting up R2 audio storage...");
 
-        println!("📦 Setting up R2 audio storage...");
+    // Check if R2 bucket exists
+    let bucket_exists = match client.get_r2_bucket(&bucket_name).await? {
+        Some(_) => {
+            println!("   ✓ R2 bucket exists: {}", bucket_name);
+            true
+        }
+        None => {
+            println!("   ℹ️  Creating R2 bucket: {}", bucket_name);
+            client.create_r2_bucket(&bucket_name).await?;
+            println!("   ✓ R2 bucket created");
+            false
+        }
+    };
 
-        // Check if R2 bucket exists
-        let bucket_exists = match client.get_r2_bucket(&bucket_name).await? {
-            Some(_) => {
-                println!("   ✓ R2 bucket exists: {}", bucket_name);
-                true
-            }
-            None => {
-                println!("   ℹ️  Creating R2 bucket: {}", bucket_name);
-                client.create_r2_bucket(&bucket_name).await?;
-                println!("   ✓ R2 bucket created");
-                false
-            }
-        };
+    // Upload audio files to R2 with retry logic
+    println!("   📤 Uploading audio files to R2...");
+    let audio_dir = path.join("audio");
+    if !audio_dir.exists() {
+        anyhow::bail!("Audio directory not found: {}", audio_dir.display());
+    }
 
-        // Upload audio files to R2 in parallel
-        println!("   📤 Uploading audio files to R2 (parallel)...");
-        let audio_dir = path.join("audio");
-        if !audio_dir.exists() {
-            anyhow::bail!("Audio directory not found: {}", audio_dir.display());
+    // Create rust-s3 bucket configuration for R2
+    let credentials = S3Credentials::new(
+        Some(&config.cloudflare.r2_access_key_id),
+        Some(&config.cloudflare.r2_secret_access_key),
+        None,
+        None,
+        None,
+    )?;
+
+    let region = S3Region::R2 {
+        account_id: config.cloudflare.account_id.clone(),
+    };
+
+    let bucket = S3Bucket::new(&bucket_name, region, credentials)?.with_path_style();
+
+    // Create semaphore to limit concurrent uploads (default: 3)
+    let max_concurrent_uploads = concurrency.unwrap_or(3);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_uploads));
+    println!("   ℹ️  Max concurrent uploads: {}", max_concurrent_uploads);
+
+    // Collect upload tasks
+    let mut upload_tasks = Vec::new();
+
+    for track in &album.tracks {
+        let audio_file = path.join(&track.file);
+        if !audio_file.exists() {
+            eprintln!(
+                "   ⚠️  Warning: Audio file not found: {}",
+                audio_file.display()
+            );
+            continue;
         }
 
-        // Collect upload tasks
-        let mut upload_tasks = Vec::new();
+        let filename = audio_file
+            .file_name()
+            .context("Invalid audio filename")?
+            .to_str()
+            .context("Invalid UTF-8 in filename")?
+            .to_string();
 
-        for track in &album.tracks {
-            let audio_file = path.join(&track.file);
-            if !audio_file.exists() {
-                eprintln!(
-                    "   ⚠️  Warning: Audio file not found: {}",
-                    audio_file.display()
-                );
-                continue;
-            }
+        let r2_key = format!("audio/{}", filename);
 
-            let filename = audio_file
-                .file_name()
-                .context("Invalid audio filename")?
-                .to_str()
-                .context("Invalid UTF-8 in filename")?
-                .to_string();
+        // Clone data needed for async task
+        let audio_file_clone = audio_file.clone();
+        let bucket_clone = bucket.clone();
+        let semaphore_clone = semaphore.clone();
 
-            let r2_key = format!("audio/{}", filename);
+        // Spawn upload task with retry logic and concurrency limiting
+        let task = tokio::spawn(async move {
+            // Acquire semaphore permit (limits concurrent uploads)
+            let _permit = semaphore_clone
+                .acquire()
+                .await
+                .expect("Semaphore should not be closed");
 
-            // Clone data needed for async task
-            let bucket_name_clone = bucket_name.clone();
-            let audio_file_clone = audio_file.clone();
-            let r2_access_key = config
-                .cloudflare
-                .r2_access_key_id
-                .clone()
-                .context("R2 access key missing")?;
-            let r2_secret_key = config
-                .cloudflare
-                .r2_secret_access_key
-                .clone()
-                .context("R2 secret key missing")?;
-            let account_id = config.cloudflare.account_id.clone();
+            let content_type = match audio_file_clone.extension().and_then(|e| e.to_str()) {
+                Some("flac") => "audio/flac",
+                Some("mp3") => "audio/mpeg",
+                Some("wav") => "audio/wav",
+                Some("ogg") => "audio/ogg",
+                _ => "application/octet-stream",
+            };
 
-            // Spawn upload task
-            let task = tokio::spawn(async move {
-                // Create S3 client for this upload
-                let credentials = AwsCredentials::new(
-                    &r2_access_key,
-                    &r2_secret_key,
-                    None,
-                    None,
-                    "r2-credentials",
-                );
+            // Read file into memory (for both small and large files)
+            let file_contents = tokio::fs::read(&audio_file_clone)
+                .await
+                .context("Failed to read file for upload")?;
 
-                let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
-
-                let s3_config = S3ConfigBuilder::new()
-                    .region(Region::new("auto"))
-                    .endpoint_url(&endpoint_url)
-                    .credentials_provider(credentials)
-                    .build();
-
-                let s3_client = S3Client::from_conf(s3_config);
-
-                // Upload file
-                let body = ByteStream::from_path(&audio_file_clone)
+            // Retry logic: 5 attempts with exponential backoff
+            let mut last_error = None;
+            for attempt in 1..=5 {
+                let result = bucket_clone
+                    .put_object_with_content_type(&r2_key, &file_contents, content_type)
                     .await
-                    .context("Failed to read file for upload")?;
+                    .map(|_| ());
 
-                let content_type = match audio_file_clone.extension().and_then(|e| e.to_str()) {
-                    Some("flac") => "audio/flac",
-                    Some("mp3") => "audio/mpeg",
-                    Some("wav") => "audio/wav",
-                    Some("ogg") => "audio/ogg",
-                    _ => "application/octet-stream",
-                };
-
-                s3_client
-                    .put_object()
-                    .bucket(&bucket_name_clone)
-                    .key(&r2_key)
-                    .body(body)
-                    .content_type(content_type)
-                    .send()
-                    .await
-                    .context("Failed to upload to R2")?;
-
-                Ok::<String, anyhow::Error>(filename)
-            });
-
-            upload_tasks.push(task);
-        }
-
-        // Wait for all uploads to complete
-        let mut successful_uploads = 0;
-        let mut failed_uploads = Vec::new();
-
-        for task in upload_tasks {
-            match task.await {
-                Ok(Ok(filename)) => {
-                    successful_uploads += 1;
-                    println!("      ✓ {}", filename);
-                }
-                Ok(Err(e)) => {
-                    failed_uploads.push(format!("{}", e));
-                }
-                Err(e) => {
-                    failed_uploads.push(format!("Task error: {}", e));
+                match result {
+                    Ok(_) => {
+                        return Ok::<String, anyhow::Error>(filename.clone());
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < 5 {
+                            // Exponential backoff: 1s, 2s, 3s, 4s
+                            tokio::time::sleep(Duration::from_secs(attempt)).await;
+                        }
+                    }
                 }
             }
-        }
 
-        if !failed_uploads.is_empty() {
-            eprintln!("   ⚠️  Some uploads failed:");
-            for error in &failed_uploads {
-                eprintln!("      - {}", error);
+            Err(anyhow::anyhow!(
+                "{}: Failed after 5 attempts - {}",
+                filename,
+                last_error.unwrap()
+            ))
+        });
+
+        upload_tasks.push(task);
+    }
+
+    // Wait for all uploads to complete
+    let mut successful_uploads = 0;
+    let mut failed_uploads = Vec::new();
+
+    for task in upload_tasks {
+        match task.await {
+            Ok(Ok(filename)) => {
+                successful_uploads += 1;
+                println!("      ✓ {}", filename);
             }
-            anyhow::bail!("{} upload(s) failed", failed_uploads.len());
-        }
-
-        println!("   ✓ Uploaded {} audio files", successful_uploads);
-
-        // Configure CORS if bucket was just created
-        if !bucket_exists {
-            println!("   🔧 Configuring R2 public access...");
-            client.configure_r2_public_access(&bucket_name).await?;
-            println!("   ✓ Public access configured");
-        }
-
-        // Verify bucket is accessible with R2 credentials
-        println!("   🔍 Verifying R2 bucket accessibility...");
-        match client.get_r2_bucket(&bucket_name).await {
-            Ok(Some(_)) => {
-                println!("   ✓ R2 bucket verified accessible");
-            }
-            Ok(None) => {
-                anyhow::bail!(
-                    "R2 bucket '{}' not found after creation - this shouldn't happen",
-                    bucket_name
-                );
+            Ok(Err(e)) => {
+                // Show full error chain
+                failed_uploads.push(format!("{:#}", e));
             }
             Err(e) => {
-                anyhow::bail!(
-                    "Failed to verify R2 bucket accessibility: {}\n\
-                     Please check your R2 credentials and permissions.",
+                failed_uploads.push(format!("Task panic: {}", e));
+            }
+        }
+    }
+
+    if !failed_uploads.is_empty() {
+        eprintln!("   ⚠️  Some uploads failed:");
+        for error in &failed_uploads {
+            eprintln!("      - {}", error);
+        }
+        anyhow::bail!("{} upload(s) failed", failed_uploads.len());
+    }
+
+    println!("   ✓ Uploaded {} audio files", successful_uploads);
+
+    // Configure CORS if bucket was just created (optional - R2 buckets are public by default)
+    if !bucket_exists {
+        println!("   🔧 Configuring R2 public access...");
+        match client.configure_r2_public_access(&bucket_name).await {
+            Ok(_) => {
+                println!("   ✓ Public access configured");
+            }
+            Err(e) => {
+                println!(
+                    "   ⚠️  CORS configuration failed (bucket is still publicly accessible): {}",
                     e
                 );
             }
         }
+    }
 
-        // Set up custom domain for R2 if base domain is configured
-        let cdn_url = if let Some(base_domain) = &config.cloudflare.base_domain {
-            let cdn_domain = format!("cdn.{}", base_domain);
-            println!("   🌐 Setting up custom domain: {}", cdn_domain);
+    // Verify bucket is accessible with R2 credentials
+    println!("   🔍 Verifying R2 bucket accessibility...");
+    match client.get_r2_bucket(&bucket_name).await {
+        Ok(Some(_)) => {
+            println!("   ✓ R2 bucket verified accessible");
+        }
+        Ok(None) => {
+            anyhow::bail!(
+                "R2 bucket '{}' not found after creation - this shouldn't happen",
+                bucket_name
+            );
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "Failed to verify R2 bucket accessibility: {}\n\
+                     Please check your R2 credentials and permissions.",
+                e
+            );
+        }
+    }
 
-            // Add custom domain to R2 bucket
-            match client.add_r2_custom_domain(&bucket_name, &cdn_domain).await {
-                Ok(_) => {
-                    println!("   ✓ Custom domain configured");
+    // Set up custom domain for R2 if base domain is configured
+    let cdn_url = if let Some(base_domain) = &config.cloudflare.base_domain {
+        let cdn_domain = format!("{}-audio.{}", project_name, base_domain);
+        println!("   🌐 Setting up custom domain: {}", cdn_domain);
 
-                    // Also need to create DNS record pointing to R2
-                    if let Some(zone) = client.get_dns_zone(base_domain).await? {
+        // Get DNS zone first (needed for zone ID)
+        match client.get_dns_zone(base_domain).await? {
+            Some(zone) => {
+                // Add custom domain to R2 bucket with zone ID
+                match client
+                    .add_r2_custom_domain(&bucket_name, &cdn_domain, &zone.id)
+                    .await
+                {
+                    Ok(_) => {
+                        println!("   ✓ Custom domain configured");
+
+                        // Create DNS record pointing to R2
                         let r2_target =
                             format!("{}.r2.cloudflarestorage.com", config.cloudflare.account_id);
-                        match client
-                            .create_dns_record(&zone.id, &cdn_domain, &r2_target)
-                            .await
+
+                        // Check if DNS record already exists
+                        if let Some(existing) = client.get_dns_record(&zone.id, &cdn_domain).await?
                         {
-                            Ok(_) => {
-                                println!("   ✓ DNS record created: {} → {}", cdn_domain, r2_target);
-                            }
-                            Err(e) => {
-                                println!("   ⚠️  DNS record creation failed: {}", e);
-                                println!("   💡 You may need to create it manually");
+                            println!(
+                                "   ✓ DNS record already exists: {} → {}",
+                                cdn_domain, existing.content
+                            );
+                        } else {
+                            match client
+                                .create_dns_record(&zone.id, &cdn_domain, &r2_target)
+                                .await
+                            {
+                                Ok(_) => {
+                                    println!(
+                                        "   ✓ DNS record created: {} → {}",
+                                        cdn_domain, r2_target
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("   ⚠️  DNS record creation failed: {}", e);
+                                    println!("   💡 You may need to create it manually");
+                                }
                             }
                         }
-                    }
 
-                    format!("https://{}", cdn_domain)
-                }
-                Err(e) => {
-                    println!("   ⚠️  Custom domain setup failed: {}", e);
-                    // Fall back to default R2 public URL
-                    format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
+                        format!("https://{}", cdn_domain)
+                    }
+                    Err(e) => {
+                        println!("   ⚠️  Custom domain setup failed: {}", e);
+                        // Fall back to default R2 public URL
+                        format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
+                    }
                 }
             }
-        } else {
-            // Use default R2 public URL
-            format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
-        };
-
-        println!("   ✓ Audio will be served from: {}", cdn_url);
-        println!();
-
-        Some(cdn_url)
+            None => {
+                println!("   ⚠️  DNS zone not found for {}", base_domain);
+                println!("   💡 Add your domain to Cloudflare DNS first");
+                // Fall back to default R2 public URL
+                format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
+            }
+        }
     } else {
-        println!("ℹ️  R2 not configured - bundling audio with Pages");
-        println!("   ⚠️  Warning: May exceed 25MB limit for large albums");
-        println!();
-        None
+        // Use default R2 public URL
+        format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
     };
 
-    // Build static site to temp directory
+    println!("   ✓ Audio will be served from: {}", cdn_url);
+    println!();
+
+    // Build static site to temp directory (without audio - using R2)
     println!("📦 Building static site...");
     let _temp_dir = TempDir::new().context("Failed to create temporary directory")?;
     let build_dir = _temp_dir.path();
-    build_static_site(&path, build_dir, false, audio_base_url.as_deref())?;
+    build_static_site(&path, build_dir, false, Some(&cdn_url))?;
     println!("   ✓ Built to: {}", build_dir.display());
     println!();
 
@@ -1190,20 +1364,27 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
             Some(zone) => {
                 println!("   ✓ Found DNS zone for {}", base_domain);
 
-                // Create CNAME record
+                // Check if CNAME record already exists
                 let target = format!("{}.pages.dev", project_name);
-                match client
-                    .create_dns_record(&zone.id, &full_domain, &target)
-                    .await
-                {
-                    Ok(_) => {
-                        println!("   ✓ Created DNS record: {} → {}", full_domain, target);
-                    }
-                    Err(e) => {
-                        println!("   ⚠️  DNS record creation failed: {}", e);
-                        println!(
-                            "   💡 You may need to create it manually in Cloudflare dashboard"
-                        );
+                if let Some(existing) = client.get_dns_record(&zone.id, &full_domain).await? {
+                    println!(
+                        "   ✓ DNS record already exists: {} → {}",
+                        full_domain, existing.content
+                    );
+                } else {
+                    match client
+                        .create_dns_record(&zone.id, &full_domain, &target)
+                        .await
+                    {
+                        Ok(_) => {
+                            println!("   ✓ Created DNS record: {} → {}", full_domain, target);
+                        }
+                        Err(e) => {
+                            println!("   ⚠️  DNS record creation failed: {}", e);
+                            println!(
+                                "   💡 You may need to create it manually in Cloudflare dashboard"
+                            );
+                        }
                     }
                 }
             }
@@ -1343,19 +1524,30 @@ pub async fn teardown(path: PathBuf, force: bool) -> Result<()> {
     let config = load_config()?
         .context("No Cloudflare configuration found.\nRun 'release-kit deploy configure' first")?;
 
-    // Check if project exists via API
-    println!("🔍 Checking if project exists...");
+    // Check if project and/or R2 bucket exist
+    println!("🔍 Checking deployment status...");
     let client =
         CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
 
-    match client.get_pages_project(&project_name).await? {
-        Some(_) => {
-            println!("   ✓ Project found");
-        }
-        None => {
-            println!("   ℹ️  Project not found - nothing to delete");
-            return Ok(());
-        }
+    let project_exists = client.get_pages_project(&project_name).await?.is_some();
+    let bucket_exists = client.get_r2_bucket(&bucket_name).await?.is_some();
+
+    if project_exists {
+        println!("   ✓ Pages project found");
+    } else {
+        println!("   ℹ️  Pages project not found");
+    }
+
+    if bucket_exists {
+        println!("   ✓ R2 bucket found");
+    } else {
+        println!("   ℹ️  R2 bucket not found");
+    }
+
+    if !project_exists && !bucket_exists {
+        println!();
+        println!("ℹ️  Nothing to delete - deployment already cleaned up");
+        return Ok(());
     }
     println!();
 
@@ -1373,28 +1565,45 @@ pub async fn teardown(path: PathBuf, force: bool) -> Result<()> {
         }
     }
 
-    println!("🗑️  Deleting project from Cloudflare...");
-    client.delete_pages_project(&project_name).await?;
-    println!("   ✓ Deleted from Cloudflare Pages");
+    // Delete Pages project if it exists
+    if project_exists {
+        println!("🗑️  Deleting project from Cloudflare...");
+        client.delete_pages_project(&project_name).await?;
+        println!("   ✓ Deleted from Cloudflare Pages");
+    }
 
-    // Check if R2 bucket exists and delete it
-    match client.get_r2_bucket(&bucket_name).await? {
-        Some(_) => {
-            println!("   🗑️  Deleting R2 bucket: {}", bucket_name);
-            match client.delete_r2_bucket(&bucket_name).await {
-                Ok(_) => {
-                    println!("   ✓ Deleted R2 bucket and all audio files");
-                }
-                Err(e) => {
-                    println!("   ⚠️  Failed to delete R2 bucket: {}", e);
-                    println!(
-                        "   💡 You may need to delete it manually from the Cloudflare dashboard"
-                    );
-                }
+    // Delete R2 bucket if it exists
+    if bucket_exists {
+        println!("   🗑️  Deleting R2 bucket: {}", bucket_name);
+
+        // First, empty the bucket
+        match client
+            .empty_r2_bucket(
+                &bucket_name,
+                &config.cloudflare.r2_access_key_id,
+                &config.cloudflare.r2_secret_access_key,
+            )
+            .await
+        {
+            Ok(_) => {
+                println!("   ✓ Emptied R2 bucket");
+            }
+            Err(e) => {
+                println!("   ⚠️  Failed to empty R2 bucket: {}", e);
+                println!("   💡 You may need to delete it manually from the Cloudflare dashboard");
+                return Ok(());
             }
         }
-        None => {
-            println!("   ℹ️  No R2 bucket found - nothing to delete");
+
+        // Then delete the empty bucket
+        match client.delete_r2_bucket(&bucket_name).await {
+            Ok(_) => {
+                println!("   ✓ Deleted R2 bucket");
+            }
+            Err(e) => {
+                println!("   ⚠️  Failed to delete R2 bucket: {}", e);
+                println!("   💡 You may need to delete it manually from the Cloudflare dashboard");
+            }
         }
     }
     println!();
@@ -1464,5 +1673,66 @@ mod tests {
     fn test_derive_project_name_empty_strings() {
         // Edge case: empty strings result in hyphen separator only
         assert_eq!(derive_project_name("", ""), "-");
+    }
+
+    // Validation function tests
+    #[test]
+    fn test_validate_api_token_valid() {
+        assert!(validate_api_token("abcdefghijklmnopqrstuvwxyz0123456789ABCD").is_ok());
+        assert!(validate_api_token("abc123-def456_ghi789-jkl012_mno345-pqr678").is_ok());
+    }
+
+    #[test]
+    fn test_validate_api_token_too_short() {
+        assert!(validate_api_token("short").is_err());
+        assert!(validate_api_token("").is_err());
+    }
+
+    #[test]
+    fn test_validate_api_token_invalid_chars() {
+        assert!(validate_api_token("abcdefghijklmnopqrstuvwxyz0123456789@!").is_err());
+        assert!(validate_api_token("token with spaces and is long enough!!!").is_err());
+    }
+
+    #[test]
+    fn test_validate_account_id_valid() {
+        assert!(validate_account_id("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6").is_ok());
+        assert!(validate_account_id("12345678901234567890123456789012").is_ok());
+    }
+
+    #[test]
+    fn test_validate_account_id_invalid() {
+        assert!(validate_account_id("short").is_err());
+        assert!(validate_account_id("").is_err());
+        assert!(validate_account_id("a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6").is_err()); // hyphens
+    }
+
+    #[test]
+    fn test_validate_domain_valid() {
+        assert!(validate_domain("example.com").is_ok());
+        assert!(validate_domain("subdomain.example.com").is_ok());
+        assert!(validate_domain("my-domain.org").is_ok());
+    }
+
+    #[test]
+    fn test_validate_domain_invalid() {
+        assert!(validate_domain("").is_err());
+        assert!(validate_domain("no-tld").is_err());
+        assert!(validate_domain("invalid..com").is_err());
+        assert!(validate_domain(".example.com").is_err());
+        assert!(validate_domain("example.com.").is_err());
+    }
+
+    #[test]
+    fn test_validate_r2_access_key_valid() {
+        assert!(validate_r2_access_key("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6").is_ok());
+        assert!(validate_r2_access_key("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").is_ok());
+    }
+
+    #[test]
+    fn test_validate_r2_access_key_invalid() {
+        assert!(validate_r2_access_key("short").is_err());
+        assert!(validate_r2_access_key("").is_err());
+        assert!(validate_r2_access_key("a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6").is_err()); // hyphens
     }
 }

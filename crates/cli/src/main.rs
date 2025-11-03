@@ -93,6 +93,10 @@ enum DeployCommand {
         /// Skip confirmation prompts
         #[arg(long)]
         force: bool,
+
+        /// Max concurrent uploads (default: 3)
+        #[arg(long, short = 'c')]
+        concurrency: Option<usize>,
     },
 
     /// Show deployment status and info
@@ -134,7 +138,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Build { path, output } => commands::build::run(path, output).await,
         Command::Deploy { command } => match command {
             DeployCommand::Configure => commands::deploy::configure().await,
-            DeployCommand::Publish { path, force } => commands::deploy::publish(path, force).await,
+            DeployCommand::Publish {
+                path,
+                force,
+                concurrency,
+            } => commands::deploy::publish(path, force, concurrency).await,
             DeployCommand::Status { path } => commands::deploy::status(path).await,
             DeployCommand::Teardown { path, force } => {
                 commands::deploy::teardown(path, force).await
