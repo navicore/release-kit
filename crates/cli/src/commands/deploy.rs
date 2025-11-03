@@ -730,7 +730,7 @@ fn validate_api_token(token: &str) -> Result<()> {
     if token.is_empty() {
         anyhow::bail!("API token cannot be empty");
     }
-    if token.len() < 20 {
+    if token.len() < 40 {
         anyhow::bail!("API token appears too short (expected 40+ characters)");
     }
     if !token
@@ -1061,6 +1061,13 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
 
     // R2 audio storage (always enabled)
     // R2 bucket name: {project-name}-audio
+    //
+    // Memory Requirements:
+    // - Each audio file is loaded entirely into memory during upload
+    // - For large albums with high-quality audio (e.g., 10 FLAC files @ 200MB each),
+    //   peak memory usage can reach 600MB+ (3 concurrent uploads × 200MB per file)
+    // - Adjust concurrency (-c flag) if running on memory-constrained systems
+    // - Example: Use `-c 1` for single-file uploads to minimize memory usage
     let bucket_name = format!("{}-audio", project_name);
 
     println!("📦 Setting up R2 audio storage...");
@@ -1666,5 +1673,66 @@ mod tests {
     fn test_derive_project_name_empty_strings() {
         // Edge case: empty strings result in hyphen separator only
         assert_eq!(derive_project_name("", ""), "-");
+    }
+
+    // Validation function tests
+    #[test]
+    fn test_validate_api_token_valid() {
+        assert!(validate_api_token("abcdefghijklmnopqrstuvwxyz0123456789ABCD").is_ok());
+        assert!(validate_api_token("abc123-def456_ghi789-jkl012_mno345-pqr678").is_ok());
+    }
+
+    #[test]
+    fn test_validate_api_token_too_short() {
+        assert!(validate_api_token("short").is_err());
+        assert!(validate_api_token("").is_err());
+    }
+
+    #[test]
+    fn test_validate_api_token_invalid_chars() {
+        assert!(validate_api_token("abcdefghijklmnopqrstuvwxyz0123456789@!").is_err());
+        assert!(validate_api_token("token with spaces and is long enough!!!").is_err());
+    }
+
+    #[test]
+    fn test_validate_account_id_valid() {
+        assert!(validate_account_id("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6").is_ok());
+        assert!(validate_account_id("12345678901234567890123456789012").is_ok());
+    }
+
+    #[test]
+    fn test_validate_account_id_invalid() {
+        assert!(validate_account_id("short").is_err());
+        assert!(validate_account_id("").is_err());
+        assert!(validate_account_id("a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6").is_err()); // hyphens
+    }
+
+    #[test]
+    fn test_validate_domain_valid() {
+        assert!(validate_domain("example.com").is_ok());
+        assert!(validate_domain("subdomain.example.com").is_ok());
+        assert!(validate_domain("my-domain.org").is_ok());
+    }
+
+    #[test]
+    fn test_validate_domain_invalid() {
+        assert!(validate_domain("").is_err());
+        assert!(validate_domain("no-tld").is_err());
+        assert!(validate_domain("invalid..com").is_err());
+        assert!(validate_domain(".example.com").is_err());
+        assert!(validate_domain("example.com.").is_err());
+    }
+
+    #[test]
+    fn test_validate_r2_access_key_valid() {
+        assert!(validate_r2_access_key("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6").is_ok());
+        assert!(validate_r2_access_key("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").is_ok());
+    }
+
+    #[test]
+    fn test_validate_r2_access_key_invalid() {
+        assert!(validate_r2_access_key("short").is_err());
+        assert!(validate_r2_access_key("").is_err());
+        assert!(validate_r2_access_key("a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6").is_err()); // hyphens
     }
 }
