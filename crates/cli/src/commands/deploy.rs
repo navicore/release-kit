@@ -156,7 +156,8 @@ struct PagesProject {
 #[derive(Debug, Deserialize)]
 struct DnsZone {
     id: String,
-    _name: String,
+    #[allow(dead_code)]
+    name: String,
 }
 
 /// DNS Record
@@ -183,6 +184,9 @@ struct R2Bucket {
 #[derive(Debug, Deserialize, Serialize)]
 struct R2CustomDomain {
     domain: String,
+    enabled: bool,
+    #[serde(rename = "zoneId")]
+    zone_id: String,
 }
 
 impl CloudflareClient {
@@ -632,23 +636,31 @@ impl CloudflareClient {
         );
 
         #[derive(Serialize)]
+        struct CorsAllowed {
+            methods: Vec<String>,
+            origins: Vec<String>,
+            headers: Vec<String>,
+        }
+
+        #[derive(Serialize)]
         struct CorsRule {
-            allowed_origins: Vec<String>,
-            allowed_methods: Vec<String>,
-            allowed_headers: Vec<String>,
+            allowed: CorsAllowed,
+            #[serde(rename = "MaxAgeSeconds")]
             max_age_seconds: u32,
         }
 
         #[derive(Serialize)]
         struct CorsConfig {
-            cors_rules: Vec<CorsRule>,
+            rules: Vec<CorsRule>,
         }
 
         let config = CorsConfig {
-            cors_rules: vec![CorsRule {
-                allowed_origins: vec!["*".to_string()],
-                allowed_methods: vec!["GET".to_string(), "HEAD".to_string()],
-                allowed_headers: vec!["*".to_string()],
+            rules: vec![CorsRule {
+                allowed: CorsAllowed {
+                    methods: vec!["GET".to_string(), "HEAD".to_string()],
+                    origins: vec!["*".to_string()],
+                    headers: vec!["content-type".to_string()],
+                },
                 max_age_seconds: 3600,
             }],
         };
@@ -667,18 +679,25 @@ impl CloudflareClient {
     }
 
     /// Add custom domain to R2 bucket
-    async fn add_r2_custom_domain(&self, bucket_name: &str, domain: &str) -> Result<()> {
+    async fn add_r2_custom_domain(
+        &self,
+        bucket_name: &str,
+        domain: &str,
+        zone_id: &str,
+    ) -> Result<()> {
         let url = format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/r2/buckets/{}/domains",
+            "https://api.cloudflare.com/client/v4/accounts/{}/r2/buckets/{}/domains/custom",
             self.account_id, bucket_name
         );
 
         let request = R2CustomDomain {
             domain: domain.to_string(),
+            enabled: true,
+            zone_id: zone_id.to_string(),
         };
 
         let response = self.client.post(&url).json(&request).send().await?;
-        let cf_response: CloudflareResponse<R2CustomDomain> = response.json().await?;
+        let cf_response: CloudflareResponse<serde_json::Value> = response.json().await?;
 
         if !cf_response.success {
             if let Some(error) = cf_response.errors.first() {
@@ -1239,42 +1258,58 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
         let cdn_domain = format!("{}-audio.{}", project_name, base_domain);
         println!("   🌐 Setting up custom domain: {}", cdn_domain);
 
-        // Add custom domain to R2 bucket
-        match client.add_r2_custom_domain(&bucket_name, &cdn_domain).await {
-            Ok(_) => {
-                println!("   ✓ Custom domain configured");
+        // Get DNS zone first (needed for zone ID)
+        match client.get_dns_zone(base_domain).await? {
+            Some(zone) => {
+                // Add custom domain to R2 bucket with zone ID
+                match client
+                    .add_r2_custom_domain(&bucket_name, &cdn_domain, &zone.id)
+                    .await
+                {
+                    Ok(_) => {
+                        println!("   ✓ Custom domain configured");
 
-                // Also need to create DNS record pointing to R2
-                if let Some(zone) = client.get_dns_zone(base_domain).await? {
-                    let r2_target =
-                        format!("{}.r2.cloudflarestorage.com", config.cloudflare.account_id);
+                        // Create DNS record pointing to R2
+                        let r2_target =
+                            format!("{}.r2.cloudflarestorage.com", config.cloudflare.account_id);
 
-                    // Check if DNS record already exists
-                    if let Some(existing) = client.get_dns_record(&zone.id, &cdn_domain).await? {
-                        println!(
-                            "   ✓ DNS record already exists: {} → {}",
-                            cdn_domain, existing.content
-                        );
-                    } else {
-                        match client
-                            .create_dns_record(&zone.id, &cdn_domain, &r2_target)
-                            .await
+                        // Check if DNS record already exists
+                        if let Some(existing) = client.get_dns_record(&zone.id, &cdn_domain).await?
                         {
-                            Ok(_) => {
-                                println!("   ✓ DNS record created: {} → {}", cdn_domain, r2_target);
-                            }
-                            Err(e) => {
-                                println!("   ⚠️  DNS record creation failed: {}", e);
-                                println!("   💡 You may need to create it manually");
+                            println!(
+                                "   ✓ DNS record already exists: {} → {}",
+                                cdn_domain, existing.content
+                            );
+                        } else {
+                            match client
+                                .create_dns_record(&zone.id, &cdn_domain, &r2_target)
+                                .await
+                            {
+                                Ok(_) => {
+                                    println!(
+                                        "   ✓ DNS record created: {} → {}",
+                                        cdn_domain, r2_target
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("   ⚠️  DNS record creation failed: {}", e);
+                                    println!("   💡 You may need to create it manually");
+                                }
                             }
                         }
+
+                        format!("https://{}", cdn_domain)
+                    }
+                    Err(e) => {
+                        println!("   ⚠️  Custom domain setup failed: {}", e);
+                        // Fall back to default R2 public URL
+                        format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
                     }
                 }
-
-                format!("https://{}", cdn_domain)
             }
-            Err(e) => {
-                println!("   ⚠️  Custom domain setup failed: {}", e);
+            None => {
+                println!("   ⚠️  DNS zone not found for {}", base_domain);
+                println!("   💡 Add your domain to Cloudflare DNS first");
                 // Fall back to default R2 public URL
                 format!("https://pub-{}.r2.dev", config.cloudflare.account_id)
             }
