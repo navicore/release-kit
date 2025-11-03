@@ -478,40 +478,102 @@ impl CloudflareClient {
             None,
         )?;
 
-        let endpoint = format!("https://{}.r2.cloudflarestorage.com", self.account_id);
-
-        let region = S3Region::Custom {
-            region: "auto".to_string(),
-            endpoint,
+        let region = S3Region::R2 {
+            account_id: self.account_id.clone(),
         };
 
-        let bucket = S3Bucket::new(bucket_name, region, credentials)?;
+        let bucket = S3Bucket::new(bucket_name, region, credentials)?.with_path_style();
 
         // List all objects in the bucket
+        println!("      Listing bucket: {}", bucket_name);
+        println!(
+            "      Endpoint: https://{}.r2.cloudflarestorage.com",
+            self.account_id
+        );
+
+        // List all completed objects
+        println!("      Listing completed objects...");
         let list_results = bucket.list("".to_string(), None).await?;
 
-        let mut total_objects = 0;
-        let mut deleted_objects = 0;
+        let mut all_keys = Vec::new();
 
-        // Delete all objects
-        for list in list_results {
-            total_objects += list.contents.len();
-            for obj in list.contents {
-                bucket
-                    .delete_object(&obj.key)
-                    .await
-                    .with_context(|| format!("Failed to delete object: {}", obj.key))?;
-                deleted_objects += 1;
+        // Collect all object keys
+        for (idx, list) in list_results.iter().enumerate() {
+            println!(
+                "      Page {}: {} objects, {} common prefixes, truncated: {}",
+                idx,
+                list.contents.len(),
+                list.common_prefixes.as_ref().map(|p| p.len()).unwrap_or(0),
+                list.is_truncated
+            );
+
+            for obj in &list.contents {
+                all_keys.push(obj.key.clone());
+            }
+
+            // Also check common prefixes (directories)
+            if let Some(prefixes) = &list.common_prefixes {
+                for prefix in prefixes {
+                    println!("      Found prefix: {}", prefix.prefix);
+                    // List objects under this prefix
+                    let prefix_results = bucket.list(prefix.prefix.clone(), None).await?;
+                    for prefix_list in prefix_results {
+                        for obj in &prefix_list.contents {
+                            all_keys.push(obj.key.clone());
+                        }
+                    }
+                }
             }
         }
 
+        let total_objects = all_keys.len();
+        let mut deleted_objects = 0;
+
+        // Delete all objects
+        for key in all_keys {
+            println!("      Deleting: {}", key);
+            bucket
+                .delete_object(&key)
+                .await
+                .with_context(|| format!("Failed to delete object: {}", key))?;
+            deleted_objects += 1;
+        }
+
         if total_objects > 0 {
-            println!(
-                "      Deleted {} of {} objects",
-                deleted_objects, total_objects
-            );
+            println!("      ✓ Deleted {} objects", deleted_objects);
         } else {
-            println!("      No objects found in bucket");
+            println!("      ⚠️  No completed objects found");
+        }
+
+        // List and abort incomplete multipart uploads
+        println!("      Checking for incomplete multipart uploads...");
+        let multipart_results = bucket.list_multiparts_uploads(None, None).await?;
+
+        let mut total_uploads = 0;
+        let mut aborted_uploads = 0;
+
+        for upload_list in multipart_results {
+            total_uploads += upload_list.uploads.len();
+            for upload in &upload_list.uploads {
+                println!(
+                    "      Aborting multipart upload: {} ({})",
+                    upload.key, upload.id
+                );
+                match bucket.abort_upload(&upload.key, &upload.id).await {
+                    Ok(_) => {
+                        aborted_uploads += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("      ⚠️  Failed to abort upload {}: {}", upload.key, e);
+                    }
+                }
+            }
+        }
+
+        if total_uploads > 0 {
+            println!("      ✓ Aborted {} multipart uploads", aborted_uploads);
+        } else {
+            println!("      ✓ No incomplete uploads found");
         }
 
         Ok(())
@@ -990,17 +1052,11 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
         None,
     )?;
 
-    let endpoint = format!(
-        "https://{}.r2.cloudflarestorage.com",
-        config.cloudflare.account_id
-    );
-
-    let region = S3Region::Custom {
-        region: "auto".to_string(),
-        endpoint,
+    let region = S3Region::R2 {
+        account_id: config.cloudflare.account_id.clone(),
     };
 
-    let bucket = S3Bucket::new(&bucket_name, region, credentials)?;
+    let bucket = S3Bucket::new(&bucket_name, region, credentials)?.with_path_style();
 
     // Create semaphore to limit concurrent uploads (default: 3)
     let max_concurrent_uploads = concurrency.unwrap_or(3);
@@ -1039,12 +1095,6 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
             // Acquire semaphore permit (limits to 3 concurrent uploads)
             let _permit = semaphore_clone.acquire().await.unwrap();
 
-            // Get file size to determine upload strategy
-            let file_metadata = tokio::fs::metadata(&audio_file_clone)
-                .await
-                .context("Failed to get file metadata")?;
-            let file_size = file_metadata.len();
-
             let content_type = match audio_file_clone.extension().and_then(|e| e.to_str()) {
                 Some("flac") => "audio/flac",
                 Some("mp3") => "audio/mpeg",
@@ -1053,37 +1103,18 @@ pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> 
                 _ => "application/octet-stream",
             };
 
+            // Read file into memory (for both small and large files)
+            let file_contents = tokio::fs::read(&audio_file_clone)
+                .await
+                .context("Failed to read file for upload")?;
+
             // Retry logic: 5 attempts with exponential backoff
             let mut last_error = None;
             for attempt in 1..=5 {
-                let result = if file_size > 50 * 1024 * 1024 {
-                    // Files >50MB: Use streaming/multipart upload (more resilient)
-                    use tokio::io::AsyncReadExt;
-                    let mut file = tokio::fs::File::open(&audio_file_clone)
-                        .await
-                        .context("Failed to open file for streaming")?;
-
-                    let mut buffer = Vec::new();
-                    file.read_to_end(&mut buffer)
-                        .await
-                        .context("Failed to read file for streaming")?;
-
-                    // Use put_object_stream for large files (handles chunking internally)
-                    bucket_clone
-                        .put_object_stream(&mut buffer.as_slice(), &r2_key)
-                        .await
-                        .map(|_| ())
-                } else {
-                    // Files <50MB: Regular upload
-                    let file_contents = tokio::fs::read(&audio_file_clone)
-                        .await
-                        .context("Failed to read file for upload")?;
-
-                    bucket_clone
-                        .put_object_with_content_type(&r2_key, &file_contents, content_type)
-                        .await
-                        .map(|_| ())
-                };
+                let result = bucket_clone
+                    .put_object_with_content_type(&r2_key, &file_contents, content_type)
+                    .await
+                    .map(|_| ());
 
                 match result {
                     Ok(_) => {
