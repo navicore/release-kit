@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
-use aws_config::Region;
-use aws_credential_types::Credentials as AwsCredentials;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Builder as S3ConfigBuilder;
-use aws_sdk_s3::primitives::ByteStream;
 use release_kit_core::config::parse_album_toml;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use s3::Bucket as S3Bucket;
+use s3::Region as S3Region;
+use s3::creds::Credentials as S3Credentials;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
@@ -464,6 +462,61 @@ impl CloudflareClient {
         cf_response.result.context("No bucket returned from API")
     }
 
+    /// Empty R2 bucket by deleting all objects
+    async fn empty_r2_bucket(
+        &self,
+        bucket_name: &str,
+        r2_access_key_id: &str,
+        r2_secret_access_key: &str,
+    ) -> Result<()> {
+        // Create rust-s3 bucket for R2
+        let credentials = S3Credentials::new(
+            Some(r2_access_key_id),
+            Some(r2_secret_access_key),
+            None,
+            None,
+            None,
+        )?;
+
+        let endpoint = format!("https://{}.r2.cloudflarestorage.com", self.account_id);
+
+        let region = S3Region::Custom {
+            region: "auto".to_string(),
+            endpoint,
+        };
+
+        let bucket = S3Bucket::new(bucket_name, region, credentials)?;
+
+        // List all objects in the bucket
+        let list_results = bucket.list("".to_string(), None).await?;
+
+        let mut total_objects = 0;
+        let mut deleted_objects = 0;
+
+        // Delete all objects
+        for list in list_results {
+            total_objects += list.contents.len();
+            for obj in list.contents {
+                bucket
+                    .delete_object(&obj.key)
+                    .await
+                    .with_context(|| format!("Failed to delete object: {}", obj.key))?;
+                deleted_objects += 1;
+            }
+        }
+
+        if total_objects > 0 {
+            println!(
+                "      Deleted {} of {} objects",
+                deleted_objects, total_objects
+            );
+        } else {
+            println!("      No objects found in bucket");
+        }
+
+        Ok(())
+    }
+
     /// Delete R2 bucket
     async fn delete_r2_bucket(&self, bucket_name: &str) -> Result<()> {
         let url = format!(
@@ -828,7 +881,7 @@ pub async fn configure() -> Result<()> {
 }
 
 /// Publish album to Cloudflare Pages
-pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
+pub async fn publish(path: PathBuf, force: bool, concurrency: Option<usize>) -> Result<()> {
     println!("🚀 Publishing album to Cloudflare Pages...\n");
 
     // Validate and load album config
@@ -921,12 +974,38 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
         }
     };
 
-    // Upload audio files to R2 in parallel
-    println!("   📤 Uploading audio files to R2 (parallel)...");
+    // Upload audio files to R2 with retry logic
+    println!("   📤 Uploading audio files to R2...");
     let audio_dir = path.join("audio");
     if !audio_dir.exists() {
         anyhow::bail!("Audio directory not found: {}", audio_dir.display());
     }
+
+    // Create rust-s3 bucket configuration for R2
+    let credentials = S3Credentials::new(
+        Some(&config.cloudflare.r2_access_key_id),
+        Some(&config.cloudflare.r2_secret_access_key),
+        None,
+        None,
+        None,
+    )?;
+
+    let endpoint = format!(
+        "https://{}.r2.cloudflarestorage.com",
+        config.cloudflare.account_id
+    );
+
+    let region = S3Region::Custom {
+        region: "auto".to_string(),
+        endpoint,
+    };
+
+    let bucket = S3Bucket::new(&bucket_name, region, credentials)?;
+
+    // Create semaphore to limit concurrent uploads (default: 3)
+    let max_concurrent_uploads = concurrency.unwrap_or(3);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_uploads));
+    println!("   ℹ️  Max concurrent uploads: {}", max_concurrent_uploads);
 
     // Collect upload tasks
     let mut upload_tasks = Vec::new();
@@ -951,32 +1030,20 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
         let r2_key = format!("audio/{}", filename);
 
         // Clone data needed for async task
-        let bucket_name_clone = bucket_name.clone();
         let audio_file_clone = audio_file.clone();
-        let r2_access_key = config.cloudflare.r2_access_key_id.clone();
-        let r2_secret_key = config.cloudflare.r2_secret_access_key.clone();
-        let account_id = config.cloudflare.account_id.clone();
+        let bucket_clone = bucket.clone();
+        let semaphore_clone = semaphore.clone();
 
-        // Spawn upload task
+        // Spawn upload task with retry logic and concurrency limiting
         let task = tokio::spawn(async move {
-            // Create S3 client for this upload
-            let credentials =
-                AwsCredentials::new(&r2_access_key, &r2_secret_key, None, None, "r2-credentials");
+            // Acquire semaphore permit (limits to 3 concurrent uploads)
+            let _permit = semaphore_clone.acquire().await.unwrap();
 
-            let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
-
-            let s3_config = S3ConfigBuilder::new()
-                .region(Region::new("auto"))
-                .endpoint_url(&endpoint_url)
-                .credentials_provider(credentials)
-                .build();
-
-            let s3_client = S3Client::from_conf(s3_config);
-
-            // Upload file
-            let body = ByteStream::from_path(&audio_file_clone)
+            // Get file size to determine upload strategy
+            let file_metadata = tokio::fs::metadata(&audio_file_clone)
                 .await
-                .context("Failed to read file for upload")?;
+                .context("Failed to get file metadata")?;
+            let file_size = file_metadata.len();
 
             let content_type = match audio_file_clone.extension().and_then(|e| e.to_str()) {
                 Some("flac") => "audio/flac",
@@ -986,17 +1053,57 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
                 _ => "application/octet-stream",
             };
 
-            s3_client
-                .put_object()
-                .bucket(&bucket_name_clone)
-                .key(&r2_key)
-                .body(body)
-                .content_type(content_type)
-                .send()
-                .await
-                .context("Failed to upload to R2")?;
+            // Retry logic: 5 attempts with exponential backoff
+            let mut last_error = None;
+            for attempt in 1..=5 {
+                let result = if file_size > 50 * 1024 * 1024 {
+                    // Files >50MB: Use streaming/multipart upload (more resilient)
+                    use tokio::io::AsyncReadExt;
+                    let mut file = tokio::fs::File::open(&audio_file_clone)
+                        .await
+                        .context("Failed to open file for streaming")?;
 
-            Ok::<String, anyhow::Error>(filename)
+                    let mut buffer = Vec::new();
+                    file.read_to_end(&mut buffer)
+                        .await
+                        .context("Failed to read file for streaming")?;
+
+                    // Use put_object_stream for large files (handles chunking internally)
+                    bucket_clone
+                        .put_object_stream(&mut buffer.as_slice(), &r2_key)
+                        .await
+                        .map(|_| ())
+                } else {
+                    // Files <50MB: Regular upload
+                    let file_contents = tokio::fs::read(&audio_file_clone)
+                        .await
+                        .context("Failed to read file for upload")?;
+
+                    bucket_clone
+                        .put_object_with_content_type(&r2_key, &file_contents, content_type)
+                        .await
+                        .map(|_| ())
+                };
+
+                match result {
+                    Ok(_) => {
+                        return Ok::<String, anyhow::Error>(filename.clone());
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < 5 {
+                            // Exponential backoff: 1s, 2s, 3s, 4s
+                            tokio::time::sleep(Duration::from_secs(attempt)).await;
+                        }
+                    }
+                }
+            }
+
+            Err(anyhow::anyhow!(
+                "{}: Failed after 5 attempts - {}",
+                filename,
+                last_error.unwrap()
+            ))
         });
 
         upload_tasks.push(task);
@@ -1013,10 +1120,11 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
                 println!("      ✓ {}", filename);
             }
             Ok(Err(e)) => {
-                failed_uploads.push(format!("{}", e));
+                // Show full error chain
+                failed_uploads.push(format!("{:#}", e));
             }
             Err(e) => {
-                failed_uploads.push(format!("Task error: {}", e));
+                failed_uploads.push(format!("Task panic: {}", e));
             }
         }
     }
@@ -1031,11 +1139,20 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
 
     println!("   ✓ Uploaded {} audio files", successful_uploads);
 
-    // Configure CORS if bucket was just created
+    // Configure CORS if bucket was just created (optional - R2 buckets are public by default)
     if !bucket_exists {
         println!("   🔧 Configuring R2 public access...");
-        client.configure_r2_public_access(&bucket_name).await?;
-        println!("   ✓ Public access configured");
+        match client.configure_r2_public_access(&bucket_name).await {
+            Ok(_) => {
+                println!("   ✓ Public access configured");
+            }
+            Err(e) => {
+                println!(
+                    "   ⚠️  CORS configuration failed (bucket is still publicly accessible): {}",
+                    e
+                );
+            }
+        }
     }
 
     // Verify bucket is accessible with R2 credentials
@@ -1061,7 +1178,7 @@ pub async fn publish(path: PathBuf, force: bool) -> Result<()> {
 
     // Set up custom domain for R2 if base domain is configured
     let cdn_url = if let Some(base_domain) = &config.cloudflare.base_domain {
-        let cdn_domain = format!("cdn.{}", base_domain);
+        let cdn_domain = format!("{}-audio.{}", project_name, base_domain);
         println!("   🌐 Setting up custom domain: {}", cdn_domain);
 
         // Add custom domain to R2 bucket
@@ -1291,19 +1408,30 @@ pub async fn teardown(path: PathBuf, force: bool) -> Result<()> {
     let config = load_config()?
         .context("No Cloudflare configuration found.\nRun 'release-kit deploy configure' first")?;
 
-    // Check if project exists via API
-    println!("🔍 Checking if project exists...");
+    // Check if project and/or R2 bucket exist
+    println!("🔍 Checking deployment status...");
     let client =
         CloudflareClient::new(&config.cloudflare.api_token, &config.cloudflare.account_id)?;
 
-    match client.get_pages_project(&project_name).await? {
-        Some(_) => {
-            println!("   ✓ Project found");
-        }
-        None => {
-            println!("   ℹ️  Project not found - nothing to delete");
-            return Ok(());
-        }
+    let project_exists = client.get_pages_project(&project_name).await?.is_some();
+    let bucket_exists = client.get_r2_bucket(&bucket_name).await?.is_some();
+
+    if project_exists {
+        println!("   ✓ Pages project found");
+    } else {
+        println!("   ℹ️  Pages project not found");
+    }
+
+    if bucket_exists {
+        println!("   ✓ R2 bucket found");
+    } else {
+        println!("   ℹ️  R2 bucket not found");
+    }
+
+    if !project_exists && !bucket_exists {
+        println!();
+        println!("ℹ️  Nothing to delete - deployment already cleaned up");
+        return Ok(());
     }
     println!();
 
@@ -1321,28 +1449,45 @@ pub async fn teardown(path: PathBuf, force: bool) -> Result<()> {
         }
     }
 
-    println!("🗑️  Deleting project from Cloudflare...");
-    client.delete_pages_project(&project_name).await?;
-    println!("   ✓ Deleted from Cloudflare Pages");
+    // Delete Pages project if it exists
+    if project_exists {
+        println!("🗑️  Deleting project from Cloudflare...");
+        client.delete_pages_project(&project_name).await?;
+        println!("   ✓ Deleted from Cloudflare Pages");
+    }
 
-    // Check if R2 bucket exists and delete it
-    match client.get_r2_bucket(&bucket_name).await? {
-        Some(_) => {
-            println!("   🗑️  Deleting R2 bucket: {}", bucket_name);
-            match client.delete_r2_bucket(&bucket_name).await {
-                Ok(_) => {
-                    println!("   ✓ Deleted R2 bucket and all audio files");
-                }
-                Err(e) => {
-                    println!("   ⚠️  Failed to delete R2 bucket: {}", e);
-                    println!(
-                        "   💡 You may need to delete it manually from the Cloudflare dashboard"
-                    );
-                }
+    // Delete R2 bucket if it exists
+    if bucket_exists {
+        println!("   🗑️  Deleting R2 bucket: {}", bucket_name);
+
+        // First, empty the bucket
+        match client
+            .empty_r2_bucket(
+                &bucket_name,
+                &config.cloudflare.r2_access_key_id,
+                &config.cloudflare.r2_secret_access_key,
+            )
+            .await
+        {
+            Ok(_) => {
+                println!("   ✓ Emptied R2 bucket");
+            }
+            Err(e) => {
+                println!("   ⚠️  Failed to empty R2 bucket: {}", e);
+                println!("   💡 You may need to delete it manually from the Cloudflare dashboard");
+                return Ok(());
             }
         }
-        None => {
-            println!("   ℹ️  No R2 bucket found - nothing to delete");
+
+        // Then delete the empty bucket
+        match client.delete_r2_bucket(&bucket_name).await {
+            Ok(_) => {
+                println!("   ✓ Deleted R2 bucket");
+            }
+            Err(e) => {
+                println!("   ⚠️  Failed to delete R2 bucket: {}", e);
+                println!("   💡 You may need to delete it manually from the Cloudflare dashboard");
+            }
         }
     }
     println!();

@@ -36,6 +36,4 @@ toml = { workspace = true }
 reqwest = { workspace = true }
 zip = "2"
 mime_guess = "2"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
-aws-credential-types = "1"
+rust-s3 = "0.35"
