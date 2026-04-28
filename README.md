@@ -1,3 +1,8 @@
+<!-- ghmig:moved -->
+> **This repository has moved to [https://git.navicore.tech/navicore/release-kit](https://git.navicore.tech/navicore/release-kit).**
+>
+> The GitHub copy is archived and no longer maintained.
+
 # release-kit
 
 A static site generator for independent musicians to create standalone album
